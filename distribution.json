@@ -1,0 +1,9 @@
+{
+  "source_commit": "c21d45bf114377d1ccb9e9508cd35411dc3b16c8",
+  "extension_path": ".github/extensions/agent-review",
+  "prerequisites": {
+    "python": "3.11+",
+    "node": "20+",
+    "dotnet": "10.0"
+  }
+}
