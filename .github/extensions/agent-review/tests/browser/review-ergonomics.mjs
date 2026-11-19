@@ -1,3 +1,4 @@
+import { openChangeDetails } from "./review-details-helper.mjs";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { execFile } from "node:child_process";
@@ -8,6 +9,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ReviewState } from "../../review-state.mjs";
 import { startReviewServer } from "../../server.mjs";
+const openChangeSummary = async (page) => {
+    const details = page.locator("#review-background");
+    if (await details.isVisible() && !await details.evaluate((element) => element.open)) await details.locator(":scope > summary").click();
+};
+
 
 const require = createRequire(process.env.AGENT_REVIEW_BROWSER_PACKAGE || import.meta.url);
 const { chromium } = require("playwright-core");
@@ -55,15 +61,20 @@ try {
         const errors = [];
         page.on("pageerror", (error) => errors.push(error.message));
         await page.goto(`${server.url}?scoutTheme=${theme}`);
+        await openChangeDetails(page);
         if (theme === "light") {
             const pending = page.locator("#change-brief .ai-pending");
             await pending.waitFor();
             assert.match(await pending.textContent(), /Copilot is summarizing the whole change/);
             assert.equal(await pending.locator(".ai-pending-line").count(), 4, "the placeholder previews the result's shape");
             releaseOverview();
+            await openChangeDetails(page);
+
             await page.locator("#change-brief .brief-ai.ai-reveal").waitFor();
             assert.equal(await page.locator("#change-brief .ai-pending").count(), 0);
         } else {
+            await openChangeDetails(page);
+
             await page.locator("#change-brief .brief-ai").waitFor();
             assert.equal(await page.locator("#change-brief .brief-ai.ai-reveal").count(), 0, "results already present do not re-animate");
         }
@@ -88,6 +99,7 @@ try {
         assert.equal(await page.locator("#source .cited-start").count(), 2);
         await page.click("#source-close");
 
+        await openChangeSummary(page);
         await page.locator("#summary .metric").filter({ hasText: "Files" }).click();
         await page.locator(".collection-row").filter({ hasText: "worker.py" }).click();
         await page.waitForFunction(() => document.querySelector("#source-title").textContent === "worker.py");
@@ -115,6 +127,8 @@ try {
         assert.equal(await page.locator('#source .code-row[data-new-line="200"]').count(), 0, "the region collapses again");
         assert.equal(await page.locator('#source [data-gap="156-286"]').evaluate((row) => row === document.activeElement), true,
             "focus stays on the toggle for keyboard users");
+        assert.match(await page.locator('#source .code-row[data-new-line="151"]').getAttribute("class"), /diff-add/);
+        assert.match(await page.locator('#source .code-row[data-old-line="151"]:not([data-new-line])').getAttribute("class"), /diff-delete/);
 
         await page.locator('.tab[data-tab="current"]').click();
         const ruler = page.locator("#source-ruler");
@@ -134,8 +148,6 @@ try {
             const box = row.getBoundingClientRect();
             return box.top >= view.top && box.bottom <= view.bottom;
         }), "clicking a mark brings that change into view");
-        assert.match(await page.locator('#source .code-row[data-new-line="151"]').getAttribute("class"), /diff-modified/);
-
         await page.click("#source-close");
         assert.equal(await page.locator("#source-panel").isVisible(), false);
         assert.equal(await page.locator(".workspace").evaluate((node) => node.classList.contains("detail-collapsed")), true,

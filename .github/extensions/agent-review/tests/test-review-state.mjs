@@ -2,6 +2,187 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { ReviewState } from "../review-state.mjs";
+import { buildAnnotationPrompt } from "../ai-prompts.mjs";
+import { managedCopilotPath } from "../managed-copilot.mjs";
+
+test("review summaries omit transcripts and session prompts require bounded explicit pages", () => {
+    const state = new ReviewState("C:\\repo");
+    state.model = {
+        metadata: { head: "saved-head" }, summary: { files_changed: 10 }, warnings: [],
+        attention: Array.from({ length: 30 }, (_, index) => ({
+            id: `finding:${index}`, title: `Concern ${index}`, impact_score: index,
+        })),
+    };
+    const turns = Array.from({ length: 96 }, (_, index) => ({
+        id: `turn:${index}`, prompt: `Prompt ${index} ${"x".repeat(1000)}`,
+        referenced_files: Array.from({ length: 100 }, (_, file) => `src/file${file}.js`),
+        agent_activity: [{ summary: "TRANSCRIPT CONTENT ".repeat(2000) }],
+    }));
+    state.sessionContext = {
+        provenance: "copilot_session_history", factual_status: "context_only",
+        intent: [{ summary: "UNRELATED INTENT" }], timeline: [{ summary: "RAW TIMELINE" }],
+        recent_activity: turns[0].agent_activity, turns, event_count: 10000,
+    };
+    assert.ok(JSON.stringify(state.sessionContext).length > 1_200_000);
+    state.selection = { id: "unknown-selection" };
+    const summary = state.contextFor(null);
+    assert.equal(summary.metadata.head, "saved-head");
+    assert.equal(summary.top_concerns[0].id, "finding:29");
+    assert.equal(summary.omitted_concerns, 20);
+    assert.equal(summary.session_context.turn_count, 96);
+    assert.ok(JSON.stringify(summary).length < 5_000);
+    assert.doesNotMatch(JSON.stringify(summary), /TRANSCRIPT CONTENT|UNRELATED INTENT|RAW TIMELINE|Prompt 0/);
+    const page = state.sessionChangeContext({ include_turns: true, offset: 25, limit: 25 });
+    assert.equal(page.turns.length, 25);
+    assert.equal(page.turns[0].id, "turn:25");
+    assert.equal(page.next_offset, 50);
+    assert.equal(page.turns[0].omitted_referenced_files, 80);
+    assert.equal(page.turns[0].activity_count, 1);
+    assert.ok(JSON.stringify(page).length < 40_000);
+    assert.doesNotMatch(JSON.stringify(page), /TRANSCRIPT CONTENT/);
+    assert.equal(state.sessionChangeContext({ include_turns: true, offset: 95 }).next_offset, null);
+    assert.deepEqual(state.sessionChangeContext({ include_turns: true, offset: 100 }).turns, []);
+    for (const input of [{ include_turns: "yes" }, { offset: -1 }, { offset: 0.5 }, { limit: 0 }, { limit: 26 }]) {
+        assert.throws(() => state.sessionChangeContext(input), /Session context requires/);
+    }
+});
+
+test("prompt paging waits for older historical turns before returning offsets", async () => {
+    let finishHistory;
+    const history = new Promise((resolve) => { finishHistory = resolve; });
+    const state = new ReviewState("C:\\repo", {
+        currentSessionId: "current",
+        getSessionEvents: async () => Array.from({ length: 15 }, (_, index) => ({
+            id: `current:${index}`, type: "user.message",
+            timestamp: `2026-11-01T12:${String(index).padStart(2, "0")}:00Z`,
+            data: { content: `Current prompt ${index}` },
+        })),
+        getHistoricalSessionContexts: () => history,
+    });
+    const counts = await state.readSessionChangeContext();
+    assert.equal(counts.turn_count, 15, "counts remain available while history loads");
+    let returned = false;
+    const firstPage = state.readSessionChangeContext({ include_turns: true }).then((page) => {
+        returned = true;
+        return page;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(returned, false);
+    finishHistory({ contexts: [{
+        session_id: "older", event_count: 20,
+        turns: Array.from({ length: 20 }, (_, index) => ({
+            id: `older:${index}`, started_at: `2026-10-01T12:${String(index).padStart(2, "0")}:00Z`,
+            prompt: `Older prompt ${index}`, referenced_files: [], agent_activity: [],
+        })),
+    }], failures: [] });
+    let page = await firstPage;
+    const ids = [];
+    while (true) {
+        ids.push(...page.turns.map((turn) => turn.id));
+        if (page.next_offset === null) break;
+        page = await state.readSessionChangeContext({ include_turns: true, offset: page.next_offset });
+    }
+    assert.equal(ids.length, 35);
+    assert.equal(new Set(ids).size, 35);
+    assert.equal(ids[0], "older:0");
+    assert.equal(ids.at(-1), "session-turn:current:14");
+});
+
+test("annotation prefetch and foreground callers share a generation, persist its result, and retry failures", async () => {
+    let calls = 0, finish, started;
+    let ready = new Promise((resolve) => { started = resolve; });
+    const state = new ReviewState("C:\\repo", {
+        generateAnnotation: () => {
+            calls++;
+            started();
+            return new Promise((resolve, reject) => { finish = { resolve, reject }; });
+        },
+    });
+    state.model = { metadata: {}, summary: {}, warnings: [], coverage: {}, nodes: [], edges: [], evidence: {},
+        changes: [{ path: "a.js", status: "modified", lines_added: 1, lines_removed: 1 }],
+        source_files: { "a.js": { base: "export const value = 1;\n", current: "export const value = 2;\n" } } };
+    const prefetch = state.annotationFor("file:a.js");
+    const foreground = state.annotationFor("file:a.js");
+    await ready;
+    assert.equal(calls, 1);
+    finish.resolve("## What changed\n\nThe saved value is two.");
+    const annotation = await prefetch;
+    assert.equal(await foreground, annotation);
+    assert.equal(await state.annotationFor("file:a.js"), annotation);
+    assert.equal(calls, 1, "completed prefetch remains cached");
+    delete state.annotations["file:a.js"];
+    ready = new Promise((resolve) => { started = resolve; });
+    const failed = state.annotationFor("file:a.js");
+    await ready;
+    finish.reject(new Error("Provider unavailable"));
+    await assert.rejects(failed, /Provider unavailable/);
+    assert.equal(state.annotationPromises.size, 0, "failure releases the shared request");
+    ready = new Promise((resolve) => { started = resolve; });
+    const retry = state.annotationFor("file:a.js");
+    await ready;
+    finish.resolve("## What changed\n\nThe retried explanation.");
+    await retry;
+    assert.equal(calls, 3);
+});
+
+test("committed unsupported files and their sections send late saved edits to the explanation provider", async () => {
+    const requests = [];
+    const state = new ReviewState("C:\\repo", {
+        generateAnnotation: async (context) => {
+            requests.push(context);
+            return "The saved return value changes from 10 to 20.";
+        },
+    });
+    const baseline = Array.from({ length: 300 }, (_, index) => `// line ${index + 1}`);
+    const current = [...baseline];
+    baseline[249] = "int limit() { return 10; }";
+    current[249] = "int limit() { return 20; }";
+    state.reviewTarget = { mode: "commit", currentRef: "saved-current" };
+    state.model = {
+        metadata: { base_sha: "saved-base", head_sha: "saved-current" }, summary: {}, warnings: [], coverage: {},
+        nodes: [], edges: [], evidence: {},
+        changes: [{ path: "src/native.cpp", status: "modified", lines_added: 1, lines_removed: 1,
+            current_lines: 300, baseline_lines: 300 }],
+        source_files: { "src/native.cpp": {
+            baseline: baseline.join("\n"), current: current.join("\n"),
+            diff: "@@ -250 +250 @@\n-int limit() { return 10; }\n+int limit() { return 20; }\n",
+        } },
+    };
+    for (const id of ["file:src/native.cpp", "section:file:src/native.cpp"]) {
+        const annotation = await state.annotationFor(id);
+        const code = requests.at(-1).code_context;
+        assert.match(code.base.ranges.map((range) => range.excerpt).join("\n"), /return 10/);
+        assert.match(code.current.ranges.map((range) => range.excerpt).join("\n"), /return 20/);
+        assert.match(code.diff, /\+int limit/);
+        assert.equal(annotation.source_scope.limits.unrelated_diff_hunks, 0);
+    }
+    assert.equal(requests.length, 2);
+});
+
+test("missing managed CLI reports a history error without discarding analysis or current context", async () => {
+    const state = new ReviewState("C:\\repo", {
+        currentSessionId: "current-session",
+        getSessionEvents: async () => [{
+            id: "request", type: "user.message", timestamp: "2026-10-11T10:00:00Z",
+            data: { content: "Add a retry limit." },
+        }],
+        getHistoricalSessionContexts: () => managedCopilotPath({
+            platform: "win32", execPath: "C:\\node.exe", env: {},
+        }),
+    });
+    const model = { changes: [{ path: "src/feature.py", status: "modified" }] };
+    state.model = model;
+    await state.refreshSessionContext(false);
+    await state.historicalContextPromise;
+    assert.equal(state.model, model);
+    assert.equal(state.sessionContext.historical_search_complete, true);
+    assert.equal(state.sessionContext.turns[0].prompt, "Add a retry limit.");
+    assert.equal(state.sessionHistories.get("current-session").turns.length, 1);
+    const status = state.attributionStatusForPath("unmatched.py");
+    assert.equal(status.status, "error");
+    assert.match(status.message, /Unable to read historical sessions:.*LOCALAPPDATA/);
+    assert.match(status.message, /Update or restart the GitHub app/);
+});
 
 test("historical session search times out instead of remaining in loading state", async () => {
     const state = new ReviewState("C:\\repo", {
@@ -79,6 +260,29 @@ test("overview includes bounded saved implementation and test evidence, never li
     assert.ok(context.code_context.reduce((count, file) => count + file.diff.length + file.current.length, 0) <= 40000);
 });
 
+test("annotation context bounds analyzer warnings and prioritizes the selected path", () => {
+    const state = new ReviewState("C:\\repo");
+    const path = "web-ui/src/components/Sidebar/LLMConfigModal.jsx";
+    state.model = {
+        metadata: {}, summary: {}, changes: [], coverage: { available: false }, evidence: {},
+        edges: [], package_changes: [], attention: [],
+        nodes: [{ id: "function", kind: "function", name: "handleChatGPTConnect", path }],
+        warnings: [
+            ...Array.from({ length: 18_000 }, (_, index) => `vendor-${index}.js: unresolved call ${"x".repeat(200)}`),
+            `${path}:42: unresolved call relevantToSelection()`,
+        ],
+    };
+
+    const context = state.contextFor("function");
+
+    assert.match(context.analysis_quality.warnings[0], /LLMConfigModal/);
+    assert.ok(context.analysis_quality.warnings.length <= 40);
+    assert.ok(context.analysis_quality.omitted_warnings > 17_000);
+    assert.equal(context.analysis_quality.warnings_truncated, true);
+    assert.ok(JSON.stringify(context).length < 15_000);
+    assert.ok(buildAnnotationPrompt(context).length < 20_000);
+});
+
 test("empty worktree, commit and PR reviews skip automatic custom checks and summaries", async () => {
     let summaries = 0, customRuns = 0;
     const state = new ReviewState("C:\\repo", {
@@ -103,9 +307,14 @@ test("automatic summary captures originating history only after the bounded sear
         generateAnnotation: async (context) => { received = context; return "## Summary\n\n- Feature.\n\n## Review order\n\n- Source.\n\n## Gaps\n\n- Coverage."; },
     });
     state.model = { summary: {}, changes: [{ path: "main.py", status: "added", lines_added: 1, lines_removed: 0 }], nodes: [], attention: [], coverage: {}, warnings: [] };
+    state.lastAnalyzedAt = "2026-10-03T11:00:00Z";
     const request = state.overviewFor();
     assert.equal(received, undefined);
-    finishHistory({ contexts: [{ session_id: "authoring", turns: [],
+    finishHistory({ contexts: [{ session_id: "authoring", turns: [{
+        id: "authoring", session_id: "authoring", prompt_event_id: "authoring",
+        prompt: "Implement YAML configuration importing.", started_at: "2026-10-03T10:00:00Z",
+        agent_activity: [{ timestamp: "2026-10-03T10:01:00Z", operation: "write", referenced_files: ["main.py"] }],
+    }],
         intent: [{ timestamp: "2026-10-03T10:00:00Z", summary: "Implement YAML configuration importing." }],
         recent_activity: [], referenced_files: [], event_count: 1 }], failures: [] });
     await request;
@@ -130,9 +339,117 @@ test("commit summary intent cannot borrow goals from a newer same-repository fea
     assert.deepEqual(state.overviewContext().session_intent, ["Create cron planning."]);
     assert.equal(state.overviewContext().session_attribution[0].prompt, "Create cron planning.");
     state.reviewTarget = { mode: "worktree" };
+    assert.deepEqual(state.overviewContext().session_attribution, [], "an unknown snapshot time cannot establish an originating edit");
+    state.lastAnalyzedAt = "2026-10-03T12:00:00Z";
     assert.equal(state.overviewContext().session_attribution[0].prompt, "Create YAML importing.");
     state.lastAnalyzedAt = "2026-10-03T10:00:00Z";
     assert.equal(state.overviewContext().session_attribution[0].prompt, "Create cron planning.", "a saved worktree also excludes edits after its analysis");
+});
+
+test("historical reviews never fall back to unrelated repository intent", () => {
+    const state = new ReviewState("C:\\repo", {
+        reviewTarget: {
+            mode: "commit",
+            currentRef: "a".repeat(40),
+            intent: { kind: "commit", subject: "Upgrade dependency", body: "Resolve an advisory." },
+        },
+    });
+    state.model = {
+        summary: {},
+        metadata: { generated_at: "2026-10-10T08:05:04Z" },
+        changes: [{ path: "package-lock.json", status: "modified", lines_added: 2, lines_removed: 2 }],
+        source_files: { "package-lock.json": { current: "{}", diff: "+new" } },
+        nodes: [], attention: [], package_changes: [], coverage: {}, warnings: [],
+    };
+    state.sessionContext = {
+        intent: [
+            { timestamp: "2026-10-05T23:24:59Z", summary: "Contact the paper authors." },
+            { timestamp: "2026-10-05T23:34:55Z", summary: "Inspect incorrect dataset lines." },
+        ],
+        turns: [],
+    };
+
+    const context = state.overviewContext();
+
+    assert.deepEqual(context.session_intent, []);
+    assert.equal(context.commit_intent.subject, "Upgrade dependency");
+});
+
+test("read-only triage and filename mentions never become review purpose or originating context", async () => {
+    let source;
+    const state = new ReviewState("C:\\repo", { generateAnnotation: async (context) => {
+        source = context;
+        return "The saved value changes.";
+    } });
+    state.refreshHistoricalSessionContexts = () => null;
+    const before = "2026-11-01T12:00:00Z";
+    state.model = {
+        summary: {}, metadata: { generated_at: before },
+        changes: [{ path: "src/app.py", status: "modified", lines_added: 1, lines_removed: 1 }],
+        source_files: { "src/app.py": { current: "return 2", diff: "-return 1\n+return 2" } },
+        nodes: [], edges: [], evidence: {}, attention: [], coverage: {}, warnings: [],
+    };
+    state.lastAnalyzedAt = before;
+    for (const mode of ["pr", "commit", "worktree"]) {
+        state.reviewTarget = { mode, intent: { kind: mode, title: "Author's change", body: "Actual change description." } };
+        for (const prompt of ["Land the fix once you have confidence.", "Review app.py and merge the fix.",
+            "Create an explanation of app.py.", "app.py came up in another conversation."]) {
+            state.sessionContext = {
+                historical_search_complete: true,
+                intent: [{ timestamp: "2026-11-01T11:00:00Z", summary: prompt }],
+                turns: [{
+                    id: "triage", session_id: "triage", prompt_event_id: "triage", prompt,
+                    started_at: "2026-11-01T11:00:00Z",
+                    agent_activity: [{ timestamp: "2026-11-01T11:01:00Z", operation: "read",
+                        referenced_files: ["src/app.py"], summary: "Inspect the fix" }],
+                }],
+            };
+            const overview = state.overviewContext();
+            assert.deepEqual(overview.session_intent, [], `${mode}: ${prompt}`);
+            assert.deepEqual(overview.session_attribution, []);
+            assert.equal(overview.commit_intent.body, "Actual change description.");
+            state.annotations = {};
+            await state.annotationFor("file:src/app.py");
+            assert.deepEqual(source.session_intent, []);
+            assert.deepEqual(source.session_attribution, []);
+            const provenance = state.attributionStatusForPath("src/app.py");
+            assert.equal(provenance.status, "no_match");
+            assert.doesNotMatch(JSON.stringify({ overview, source, provenance, snapshot: state.snapshot(), canvas: state.contextFor() }),
+                /Land the fix|Review app\.py|Create an explanation|another conversation/);
+        }
+    }
+});
+
+test("default session context is status-only; transcripts remain available through explicit history access", () => {
+    const state = new ReviewState("C:\\repo");
+    const context = {
+        session_id: "authoring", session_summary: "Private session title", historical_search_complete: true,
+        intent: [{ summary: "Private prompt" }], turns: [{ prompt: "Private prompt" }],
+        timeline: [{ summary: "Private activity" }], recent_activity: [{ summary: "Private activity" }],
+    };
+    state.sessionContext = context;
+    state.sessionHistories.set("authoring", context);
+    assert.equal(state.snapshot().session_context.historical_search_complete, true);
+    assert.doesNotMatch(JSON.stringify(state.snapshot().session_context), /Private/);
+    assert.equal(state.sessionHistoryFor("authoring").turns[0].prompt, "Private prompt");
+});
+
+test("overview finds authoring evidence beyond its largest source files, including test-only edits", () => {
+    const state = new ReviewState("C:\\repo");
+    state.lastAnalyzedAt = "2026-11-01T12:00:00Z";
+    state.model = {
+        summary: {}, nodes: [], attention: [], coverage: {}, warnings: [],
+        changes: ["src/a.py", "src/b.py", "src/c.py", "tests/test_app.py"].map((path, index) => ({
+            path, status: "modified", lines_added: 10 - index, lines_removed: 1,
+        })),
+    };
+    state.sessionContext = { turns: [{
+        id: "tests", prompt: "Cover empty input.", started_at: "2026-11-01T11:00:00Z",
+        agent_activity: [{ timestamp: "2026-11-01T11:01:00Z", operation: "write",
+            referenced_files: ["tests/test_app.py"] }],
+    }] };
+    assert.deepEqual(state.overviewContext().session_intent, ["Cover empty input."]);
+    assert.equal(state.overviewContext().session_attribution[0].path, "tests/test_app.py");
 });
 
 test("base ref is re-resolved on every refresh", async () => {

@@ -4,6 +4,11 @@ import { readFile } from "node:fs/promises";
 import { isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { spawnOwnedAnalyzer } from "./ownership-guard.mjs";
 
+export function rustSourceHash(source) {
+    // Rust source loading ignores a leading BOM and normalizes CRLF to LF.
+    return createHash("sha256").update(source.replace(/^\uFEFF/, "").replaceAll("\r\n", "\n")).digest("hex");
+}
+
 export function resolveCargoRuntime(root, config = {}) {
     const configured = config.test_cargo || process.env.AGENT_REVIEW_TEST_CARGO;
     const executable = configured && !isAbsolute(configured) && existsSync(join(root, configured))
@@ -19,6 +24,10 @@ export function cargoTestPlan(map, repoRoot) {
         : !linked.length ? "No statically linked Rust #[test] functions reach changed code."
             : manifests.length !== 1 ? "Linked Rust tests must belong to one Cargo manifest per run." : null;
     const manifest = manifests[0] || null;
+    const unavailable = linked.find((test) => test.selector_error || !validTarget(test.cargo_target));
+    if (!reason && unavailable) {
+        reason = `${unavailable.id}: ${unavailable.selector_error || "The saved test has no resolved Cargo target. Reanalyze before running."}`;
+    }
     if (manifest) {
         const local = relative(repoRoot, resolve(repoRoot, manifest));
         if (isAbsolute(manifest) || !local || local === ".." || local.startsWith(`..${sep}`)
@@ -29,6 +38,7 @@ export function cargoTestPlan(map, repoRoot) {
     const tests = linked.slice(0, 100).map((test) => test.id);
     const rust_tests = linked.slice(0, 100).map((test) => ({
         id: test.id, name: test.name, path: test.path, manifest: test.manifest || "Cargo.toml",
+        cargo_target: test.cargo_target, selector_error: test.selector_error,
     }));
     return {
         tests, rust_tests, manifest, omitted: Math.max(0, linked.length - 100),
@@ -40,12 +50,24 @@ export function cargoTestPlan(map, repoRoot) {
     };
 }
 
+function validTarget(target) {
+    return ["lib", "bin", "test", "example", "bench"].includes(target?.kind)
+        && typeof target.name === "string" && target.name.length > 0 && !target.name.startsWith("-");
+}
+
 export function cargoTestCommand(runtime, plan, test = plan.rust_tests?.[0]) {
+    if (plan.reason || test?.selector_error || !validTarget(test?.cargo_target) || !test.name) {
+        throw new Error(plan.reason || test?.selector_error || "The linked test has no resolved Cargo exact selector.");
+    }
     const manifest = plan.manifest ? `.${sep}${normalize(plan.manifest)}` : `.${sep}Cargo.toml`;
-    return [runtime.executable, "test", "--manifest-path", manifest, "--locked", "--", test?.name || "<test>", "--exact", "--nocapture"];
+    const target = test.cargo_target;
+    const selector = target.kind === "lib" ? ["--lib"] : [`--${target.kind}`, target.name];
+    return [runtime.executable, "test", "--manifest-path", manifest, "--locked", ...selector,
+        "--", test.name, "--exact", "--nocapture"];
 }
 
 export function formatCargoTestCommand(runtime, plan) {
+    if (plan.reason || !plan.rust_tests?.length) return `Unavailable: ${plan.reason || "No linked Rust tests were selected."}`;
     const quote = (value) => /^[A-Za-z0-9_@.\\/:=+-]+$/.test(value) ? value
         : process.platform === "win32" ? `'${value.replaceAll("'", "''")}'` : `'${value.replaceAll("'", "'\\''")}'`;
     const command = cargoTestCommand(runtime, plan).map(quote).join(" ");
@@ -59,9 +81,9 @@ async function verifySources(root, hashes) {
         if (!local || local === ".." || local.startsWith(`..${sep}`) || isAbsolute(local)
             || !/^[a-f0-9]{64}$/.test(expected)) throw new Error(`Invalid reviewed Rust source hash: ${path}`);
         let source;
-        try { source = await readFile(file); }
+        try { source = await readFile(file, "utf8"); }
         catch (error) { throw new Error(`Unable to verify reviewed Rust source ${path}: ${error.message}`); }
-        if (createHash("sha256").update(source).digest("hex") !== expected) {
+        if (rustSourceHash(source) !== expected) {
             throw new Error(`Reviewed Rust source changed: ${path}. Reanalyze before running linked tests.`);
         }
     }
@@ -99,6 +121,7 @@ function runOwned(executable, args, { repoRoot, signal, timeoutMs, workspacePath
 }
 
 export async function runCargoTests({ repoRoot, python: runtime, plan, signal, workspacePath, timeoutMs = 300_000 }) {
+    if (plan.reason) throw new Error(plan.reason);
     if (!plan.rust_tests?.length) throw new Error(plan.reason || "No linked Rust tests were selected.");
     await verifySources(repoRoot, plan.source_hashes);
     const trace = { tests: {}, per_test_path_evidence: false };

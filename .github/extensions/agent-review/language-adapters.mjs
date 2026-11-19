@@ -3,10 +3,13 @@ import { NODE_REVIEW_ADAPTER } from "./node-review-adapter.mjs";
 import { DOTNET_REVIEW_ADAPTER } from "./dotnet-review-adapter.mjs";
 import { GO_REVIEW_ADAPTER } from "./go-review-adapter.mjs";
 import { RUST_REVIEW_ADAPTER } from "./rust-review-adapter.mjs";
+import { MARKDOWN_REVIEW_ADAPTER } from "./markdown-review-adapter.mjs";
+import { CPP_REVIEW_ADAPTER } from "./cpp-review-adapter.mjs";
 import { languageForPath } from "./web/languages.mjs";
 
 export const REVIEW_ADAPTERS = Object.freeze([
     PYTHON_REVIEW_ADAPTER, NODE_REVIEW_ADAPTER, DOTNET_REVIEW_ADAPTER, GO_REVIEW_ADAPTER, RUST_REVIEW_ADAPTER,
+    MARKDOWN_REVIEW_ADAPTER, CPP_REVIEW_ADAPTER,
 ]);
 
 export function reviewAdapter(id = "python") {
@@ -23,10 +26,12 @@ export function sourceAdapter(path) {
 // Requests stay per-language so each compiler resolves only its own symbols and project configuration.
 export function buildCodePathRequests(model, repoRoot, adapters = REVIEW_ADAPTERS) {
     const ids = new Set();
+    const unavailable = new Set((model.metadata?.unavailable_languages || []).map((item) => item.language));
     const requests = [];
     for (const adapter of adapters) {
         if (ids.has(adapter.id)) throw new Error(`Duplicate review adapter: ${adapter.id}.`);
         ids.add(adapter.id);
+        if (unavailable.has(adapter.id)) continue;
         const request = adapter.buildCodePathRequest(model, repoRoot);
         if (request) requests.push({ ...request, adapter_id: adapter.id });
     }
@@ -56,6 +61,9 @@ export function mergeCodePathMaps(maps) {
         if (verification) {
             result.verification.tests.push(...(verification.tests || []).map((test) => ({ ...test, adapter_id: map.adapter_id })));
             result.verification.omitted_tests += verification.omitted_tests || 0;
+            if (verification.omitted_test_candidates)
+                result.verification.omitted_test_candidates = (result.verification.omitted_test_candidates || 0)
+                    + verification.omitted_test_candidates;
             result.verification.test_files_examined += verification.test_files_examined || 0;
             result.verification.limited ||= Boolean(verification.limited);
         }
@@ -68,5 +76,7 @@ export function testAdapterForMap(map) {
     if (ids.length !== 1) {
         throw new Error("This review spans multiple test adapters. Run linked tests per language; combined execution is not implemented yet.");
     }
-    return reviewAdapter(ids[0]);
+    const adapter = reviewAdapter(ids[0]);
+    if (!adapter.tests) throw new Error(`${adapter.id} documents do not have an executable test adapter. Instruction compliance requires controlled agent evaluations.`);
+    return adapter;
 }

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import gzip
+import io
 import json
+import subprocess
 import sys
+from typing import Any, TextIO
 
 from churn import analyze_churn
 from codeboarding_adapter import load_codeboarding
-from git_snapshot import create_snapshot, discover_base, discover_repo, run_git
-from language_adapters import AnalysisSnapshot, active_adapters, merge_coverage
+from generated_sources import generated_paths
+from git_snapshot import create_snapshot, discover_base, discover_repo, run_git, text_lines
+from language_adapters import AdapterUnavailable, AnalysisSnapshot, LanguageAdapter, active_adapters, merge_coverage
 from review_model import ReviewModel
 
 
@@ -48,27 +54,70 @@ def build_review(
             "base_ref": base_ref,
             "base_commit": base_commit,
             "generated_at": generated_at,
+            **({"snapshot_exclusions": {
+                "changed_files": sum(int(rule["count"]) for rule in snapshot.excluded_changes),
+                "rules": list(snapshot.excluded_changes),
+            }} if snapshot.excluded_changes else {}),
             "python_loc": sum(
-                len(content.decode("utf-8", errors="replace").splitlines())
+                len(text_lines(content))
                 for path, content in snapshot.current.items() if path.endswith(".py")
             ),
         }
     )
     progress("changes", "Computing changed files and line totals", 25)
     model.changes = snapshot.changes()
-    model.source_files = snapshot.source_files(model.changes)
-    analysis_snapshot = AnalysisSnapshot(repo, snapshot.baseline, snapshot.current, base_commit,
-                                         bool(current_arg), use_cache, head)
+    generated = generated_paths(snapshot.baseline, snapshot.current)
+    for change in model.changes:
+        if change["path"] in generated:
+            change["generated"] = True
+    model.source_files = snapshot.source_files(model.changes, generated)
+    # Language adapters see only hand-written source; generated bundles stay reviewable as files.
+    analysis_snapshot = AnalysisSnapshot(repo, {path: value for path, value in snapshot.baseline.items() if path not in generated},
+                                         {path: value for path, value in snapshot.current.items() if path not in generated},
+                                         base_commit, bool(current_arg), use_cache, head)
+    if generated:
+        changed = sorted(change["path"] for change in model.changes if change["path"] in generated and change["status"] != "unchanged")
+        model.warnings.append(
+            f"{len(generated):,} generated or minified file{'s' if len(generated) != 1 else ''} (built bundles, *.min.*, source maps) "
+            f"{'were' if len(generated) != 1 else 'was'} not parsed for symbols"
+            + (f"; {len(changed):,} changed, e.g. {changed[0]}, remain reviewable as files." if changed else "; none changed in this review.")
+        )
     adapters = active_adapters(analysis_snapshot)
+    # Stage whole-language contributions so a later failure cannot leave partial facts behind.
+    contributions = {
+        adapter.id: ReviewModel(copy.deepcopy(model.repository), changes=copy.deepcopy(model.changes),
+                                source_files=copy.deepcopy(model.source_files))
+        for adapter in adapters
+    }
+    unavailable: list[dict[str, str]] = []
+
+    def adapter_failed(adapter: LanguageAdapter, phase: str, error: Exception) -> None:
+        contributions.pop(adapter.id)
+        reason = " ".join(str(error).split())[:600] or type(error).__name__
+        unavailable.append({"language": adapter.id, "phase": phase, "reason": reason})
+        name = {"node": "JavaScript / TypeScript", "csharp": "C#", "cpp": "C/C++"}.get(
+            adapter.id, adapter.id.capitalize())
+        warning = (
+            f"{name} facts unavailable: {phase} failed: {reason} "
+            "Graph, package usage and coverage facts for this language were omitted; source diffs remain available."
+        )
+        model.warnings.append(warning)
+        print(f"agent-review {adapter.id} {phase}: {error}", file=sys.stderr, flush=True)
+        progress("adapter_unavailable", warning, graph_percent)
+
+    graph_percent = 32
     progress("dependencies", "Comparing package declarations and project version pins", 32)
-    dependencies = {}
     for adapter in adapters:
-        declarations = adapter.dependencies(analysis_snapshot, model.warnings)
-        dependencies[adapter.id] = declarations
-        for key in ("baseline", "current", "changes"):
-            model.packages[key].extend(declarations[key])
+        facts = contributions[adapter.id]
+        try:
+            facts.packages = adapter.dependencies(analysis_snapshot, facts.warnings)
+        except (AdapterUnavailable, OSError, subprocess.SubprocessError) as error:
+            adapter_failed(adapter, "dependencies", error)
     graph_percent = 42
     for adapter in adapters:
+        if adapter.id not in contributions:
+            continue
+        facts = contributions[adapter.id]
         progress(adapter.graph_phase, adapter.graph_message, graph_percent)
 
         def graph_progress(message: str, percent: int) -> None:
@@ -76,15 +125,53 @@ def build_review(
             graph_percent = max(graph_percent, percent)
             progress(adapter.graph_phase, message, graph_percent)
 
-        adapter.scan(analysis_snapshot, model, dependencies[adapter.id], graph_progress)
-    if any(adapter.id != "python" for adapter in adapters):
-        model.repository["review_languages"] = [adapter.id for adapter in adapters]
+        try:
+            adapter.scan(analysis_snapshot, facts, facts.packages, graph_progress)
+        except (AdapterUnavailable, OSError, subprocess.SubprocessError) as error:
+            adapter_failed(adapter, "scan", error)
     progress("relationships", "Resolving package usage and aggregate architecture edges", 68)
+    graph_percent = 68
     for adapter in adapters:
-        adapter.resolve_package_usage(model, dependencies[adapter.id])
+        if adapter.id not in contributions:
+            continue
+        facts = contributions[adapter.id]
+        try:
+            adapter.resolve_package_usage(facts, facts.packages)
+        except (AdapterUnavailable, OSError, subprocess.SubprocessError) as error:
+            adapter_failed(adapter, "package usage", error)
     progress("coverage", "Loading coverage and changed executable-line data", 76)
-    coverage_reports = [adapter.coverage(analysis_snapshot) for adapter in adapters]
+    graph_percent = 76
+    for adapter in adapters:
+        if adapter.id not in contributions:
+            continue
+        facts = contributions[adapter.id]
+        try:
+            facts.coverage = adapter.coverage(analysis_snapshot)
+        except (AdapterUnavailable, OSError, subprocess.SubprocessError) as error:
+            adapter_failed(adapter, "coverage", error)
+    coverage_reports = []
+    for facts in contributions.values():
+        model.repository.update(facts.repository)
+        for path, saved in facts.source_files.items():
+            model.source_files.setdefault(path, {}).update(saved)
+        for key in ("symbols", "edges", "evidence", "warnings"):
+            getattr(model, key).extend(getattr(facts, key))
+        for key, values in facts.aggregates.items():
+            model.aggregates.setdefault(key, []).extend(values)
+        for key in ("baseline", "current", "changes"):
+            model.packages[key].extend(facts.packages[key])
+        model.code_paths.update(facts.code_paths)
+        model.instruction_documents.update(facts.instruction_documents)
+        coverage_reports.append(facts.coverage)
+    if unavailable or any(adapter.id != "python" for adapter in adapters):
+        model.repository["review_languages"] = [adapter.id for adapter in adapters]
+    if unavailable:
+        model.repository["analysis_incomplete"] = True
+        model.repository["unavailable_languages"] = unavailable
     model.coverage = merge_coverage(coverage_reports)
+    if unavailable:
+        model.coverage = {**model.coverage, "incomplete": True,
+                          "unavailable_languages": [item["language"] for item in unavailable]}
     for report in coverage_reports:
         model.warnings.extend(report.get("warnings", []))
     if current_arg:
@@ -102,6 +189,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--repo", help="Path within the git repository")
     value.add_argument("--base-ref", help="Git revision used as the baseline")
     value.add_argument("--current-ref", help="Analyze a committed tree instead of the worktree")
+    value.add_argument("--gzip", action="store_true", help="Write the complete JSON result as a gzip stream")
     value.add_argument("--no-cache", action="store_true", help="Scan Python files fresh without reading or writing the file cache")
     value.add_argument(
         "--exclude",
@@ -112,6 +200,32 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def write_review_json(result: dict[str, Any], output: TextIO) -> None:
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"))
+    output.write("{")
+    for index, (key, value) in enumerate(sorted(result.items())):
+        if index:
+            output.write(",")
+        output.write(encoder.encode(key) + ":")
+        if isinstance(value, dict):
+            output.write("{")
+            for child_index, (child_key, child) in enumerate(sorted(value.items())):
+                if child_index:
+                    output.write(",")
+                output.write(encoder.encode(child_key) + ":" + encoder.encode(child))
+            output.write("}")
+        elif isinstance(value, list):
+            output.write("[")
+            for child_index, child in enumerate(value):
+                if child_index:
+                    output.write(",")
+                output.write(encoder.encode(child))
+            output.write("]")
+        else:
+            output.write(encoder.encode(value))
+    output.write("}\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -119,9 +233,15 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, RuntimeError, ValueError) as error:
         print(f"agent-review analyzer: {error}", file=sys.stderr)
         return 2
+    progress("serialization", "Writing the complete saved review result", 98)
+    result = model.to_dict()
+    if args.gzip:
+        with gzip.GzipFile(fileobj=sys.stdout.buffer, mode="wb", compresslevel=1, mtime=0) as compressed:
+            with io.TextIOWrapper(compressed, encoding="utf-8", newline="\n") as output:
+                write_review_json(result, output)
+    else:
+        write_review_json(result, sys.stdout)
     progress("complete", "Analysis complete", 100)
-    json.dump(model.to_dict(), sys.stdout, sort_keys=True, separators=(",", ":"))
-    sys.stdout.write("\n")
     return 0
 
 

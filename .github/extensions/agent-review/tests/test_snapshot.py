@@ -11,10 +11,142 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "analyzer"))
-from git_snapshot import Snapshot, baseline_files, current_files
+from git_snapshot import Snapshot, baseline_files, current_files, create_snapshot, text_lines, SELF_REPOSITORY_MARKERS
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_self_source_policy_is_tracked_and_stable_for_saved_and_worktree_pairs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="arbitrary-fork-name-") as directory:
+            repo = Path(directory)
+            def git(*args: str) -> str:
+                return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.PIPE).decode().strip()
+            git("init", "-q")
+            git("config", "user.name", "Test")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "core.autocrlf", "false")
+            source = ".github/extensions/agent-review/analyzer/source.py"
+            for name in (*SELF_REPOSITORY_MARKERS, source):
+                path = repo / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"value = 1\n")
+            # Merely installing the complete layout without tracking it cannot opt in.
+            self.assertNotIn(source, current_files(repo, ()))
+            git("add", ".")
+            git("commit", "-qm", "source checkout")
+            base = git("rev-parse", "HEAD")
+            (repo / source).write_bytes(b"value = 2\n")
+            cache = repo / ".github/extensions/agent-review/node_modules/cache.py"
+            cache.parent.mkdir()
+            cache.write_text("do not collect\n")
+            snapshot = create_snapshot(repo, base, ())
+            self.assertEqual("modified", next(change["status"] for change in snapshot.changes() if change["path"] == source))
+            self.assertNotIn(cache.relative_to(repo).as_posix(), snapshot.current)
+            for marker in SELF_REPOSITORY_MARKERS[:-1]:
+                git("rm", marker)
+            git("mv", SELF_REPOSITORY_MARKERS[-1], ".github/extensions/agent-review/renamed-manifest.json")
+            # Index-only detection would re-exclude all source after staged deletion.
+            self.assertIn(source, current_files(repo, ()))
+            self.assertIn(source, create_snapshot(repo, base, ()).baseline)
+            git("add", source)
+            git("commit", "-qm", "remove markers and modify source")
+            head = git("rev-parse", "HEAD")
+            saved = create_snapshot(repo, base, (), head)
+            self.assertEqual(b"value = 1\n", saved.baseline[source])
+            self.assertEqual(b"value = 2\n", saved.current[source])
+            worktree = create_snapshot(repo, base, ())
+            self.assertIn(source, worktree.current)
+            explicit = create_snapshot(repo, base, (".github/extensions/agent-review",), head)
+            self.assertNotIn(source, explicit.baseline)
+            self.assertNotIn(source, explicit.current)
+            self.assertEqual("user", explicit.excluded_changes[0]["reason"])
+            self.assertEqual(3, explicit.excluded_changes[0]["count"])
+
+    def test_foreign_tracked_install_stays_excluded_and_reports_changed_count(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-review-") as directory:
+            repo = Path(directory)
+            def git(*args: str) -> str:
+                return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.PIPE).decode().strip()
+            git("init", "-q")
+            git("config", "user.name", "Test")
+            git("config", "user.email", "test@example.invalid")
+            source = ".github/extensions/agent-review/source.py"
+            (repo / source).parent.mkdir(parents=True)
+            (repo / source).write_text("value = 1\n")
+            (repo / SELF_REPOSITORY_MARKERS[-1]).write_text("{}")
+            git("add", ".")
+            git("commit", "-qm", "foreign tracked install")
+            base = git("rev-parse", "HEAD")
+            (repo / source).write_text("value = 2\n")
+            (repo / ".github/extensions/agent-review/untracked.py").write_text("new\n")
+            snapshot = create_snapshot(repo, base, ())
+            self.assertEqual({}, snapshot.current)
+            self.assertEqual(({"reason": "default", "pattern": ".github/extensions/agent-review", "count": 2},),
+                             snapshot.excluded_changes)
+            git("add", ".")
+            git("commit", "-qm", "installed source edits")
+            saved = create_snapshot(repo, base, (), git("rev-parse", "HEAD"))
+            self.assertEqual({}, saved.baseline)
+            self.assertEqual({}, saved.current)
+            self.assertEqual(snapshot.excluded_changes, saved.excluded_changes)
+
+    def test_large_repetitive_diff_uses_saved_bytes_and_preserves_late_change(self) -> None:
+        lines = [b"// repeated context\n"] * 20000
+        before = b"".join(lines) + b"-- old value\n"
+        after = b"".join(lines) + b"++ new value\n"
+        snapshot = Snapshot(Path("not-the-live-worktree"), "base",
+                            {"large.js": before}, {"large.js": after})
+        started = time.monotonic()
+        changes = snapshot.changes()
+        self.assertLess(time.monotonic() - started, 10, "large repetitive diffs must not use quadratic matching")
+        self.assertEqual([20001], changes[0]["added_lines"])
+        self.assertEqual([20001], changes[0]["removed_lines"])
+        self.assertEqual(1, changes[0]["lines_added"])
+        self.assertEqual(1, changes[0]["lines_removed"])
+        with patch("git_snapshot.subprocess.run", side_effect=AssertionError("diff must be reused")):
+            source = snapshot.source_files(changes)["large.js"]
+        self.assertIn("@@ -19997,5 +19997,5 @@", source["diff"])
+        self.assertIn("--- old value\n", source["diff"])
+        self.assertIn("+++ new value\n", source["diff"])
+        self.assertIn("--- a/large.js\n+++ b/large.js\n", source["diff"])
+
+    def test_large_diff_ignores_checkout_crlf_conversion(self) -> None:
+        before = b"".join(f"line {index}\n".encode() for index in range(6000))
+        after = before.replace(b"\n", b"\r\n").replace(b"line 5000\r\n", b"changed\r\n")
+        change = Snapshot(Path("unused"), "base", {"app.js": before}, {"app.js": after}).changes()[0]
+        self.assertEqual((1, 1, [5001], [5001]),
+                         (change["lines_added"], change["lines_removed"], change["added_lines"], change["removed_lines"]))
+
+    def test_lines_end_only_at_crlf_cr_or_lf_on_every_platform(self) -> None:
+        self.assertEqual(["a", "b", "c"], text_lines(b"a\nb\r\nc\r"))
+        self.assertEqual(["a\fb\u2028c\x85d"], text_lines("a\fb\u2028c\x85d\n"))
+        self.assertEqual(["", ""], text_lines(b"\r\n\n"))
+        snapshot = Snapshot(Path("unused"), "base", {"a.py": b"x = 1\ny = 2\n"}, {"a.py": "x = 1\r\ny = 3\r\n\u2028\r\n".encode()})
+        change = snapshot.changes()[0]
+        self.assertEqual((3, [2, 3], [2]), (change["current_lines"], change["added_lines"], change["removed_lines"]))
+
+    def test_generated_bundles_stay_files_but_unchanged_text_is_sent_once_or_omitted(self) -> None:
+        from generated_sources import generated_paths, is_generated_source
+        bundle = b"!function(){" + b"var a=1;" * 1000 + b"}();\n"
+        self.assertTrue(is_generated_source("static/assets/index-CO33IrX7.js", bundle), "a 8 KB single-line bundle")
+        self.assertTrue(is_generated_source("assets/core-D8n9Wfto.js", b"import{a as e}from'./x.js';" + b"e(1);" * 300),
+                        "a small one-line chunk is still minified output")
+        self.assertTrue(is_generated_source("vendor/lib.min.js", b"x\n"))
+        self.assertTrue(is_generated_source("app.js.map", b"{}"))
+        self.assertFalse(is_generated_source("src/app.js", b"export function run() {\n  return 1;\n}\n"))
+        self.assertFalse(is_generated_source("src/big.py", b"x = '" + b"a" * 9000 + b"'\n"), "only bundle languages")
+        snapshot = Snapshot(Path("unused"), "base", {
+            "src/app.ts": b"export const a = 1;\n", "assets/old-1a2b3c4d.js": bundle, "assets/kept-9z8y7x6w.js": bundle,
+        }, {
+            "src/app.ts": b"export const a = 1;\n", "assets/new-5e6f7g8h.js": bundle, "assets/kept-9z8y7x6w.js": bundle,
+        })
+        generated = generated_paths(snapshot.baseline, snapshot.current)
+        self.assertEqual({"assets/old-1a2b3c4d.js", "assets/new-5e6f7g8h.js", "assets/kept-9z8y7x6w.js"}, generated)
+        sources = snapshot.source_files(snapshot.changes(), generated)
+        self.assertEqual({"generated": True, "omitted": True}, sources["assets/kept-9z8y7x6w.js"], "unchanged bundles carry no text")
+        self.assertTrue(sources["assets/new-5e6f7g8h.js"]["generated"])
+        self.assertIn("var a=1;", sources["assets/new-5e6f7g8h.js"]["current"], "a changed bundle stays reviewable")
+        self.assertEqual({"current", "diff", "baseline_same"}, set(sources["src/app.ts"]), "unchanged text is not duplicated")
+
     def test_node_saved_sources_retain_both_trees_without_changing_python_only_shape(self) -> None:
         snapshot = Snapshot(Path("unused"), "base", {
             "main.ts": b"export function run() { return 1; }\n",
@@ -57,7 +189,8 @@ class SnapshotTests(unittest.TestCase):
                 actual = baseline_files(repo, "HEAD", (), updates.append)
             self.assertEqual(expected, actual)
             self.assertEqual(expected, current_files(repo, ()))
-            self.assertEqual(3, calls.call_count, "one ls-tree plus two cat-file batches, not one process per file")
+            self.assertEqual(2, sum("--batch" in call.args[0] for call in calls.call_args_list),
+                             "two cat-file batches, not one process per file")
             self.assertTrue(any("of 108" in update for update in updates))
             self.assertIn("Snapshot complete", updates[-1])
             self.assertEqual({}, baseline_files(repo, None, ()))
@@ -203,8 +336,8 @@ class SnapshotTests(unittest.TestCase):
             path = record["path"]
             before = snapshot.baseline.get(path)
             after = snapshot.current.get(path)
-            old_lines = before.decode(errors="replace").splitlines() if before is not None else []
-            new_lines = after.decode(errors="replace").splitlines() if after is not None else []
+            old_lines = text_lines(before)
+            new_lines = text_lines(after)
             added, removed = [], []
             for tag, start, end, new_start, new_end in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
                 if tag in ("insert", "replace"):
@@ -247,8 +380,8 @@ class SnapshotTests(unittest.TestCase):
                     snapshot = Snapshot(Path("unused"), "HEAD", {"path name.txt": before}, {"path name.txt": after})
                     changes = snapshot.changes()
                     expected = "".join(difflib.unified_diff(
-                        [f"{line}\n" for line in before.decode().splitlines()],
-                        [f"{line}\n" for line in after.decode().splitlines()],
+                        [f"{line}\n" for line in text_lines(before)],
+                        [f"{line}\n" for line in text_lines(after)],
                         fromfile="a/path name.txt", tofile="b/path name.txt", n=4,
                     ))
                     with patch("git_snapshot.difflib.unified_diff", side_effect=AssertionError("no matching needed for an empty side")):

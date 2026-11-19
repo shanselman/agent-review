@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,9 +46,9 @@ def resolved_package_version(declarations: list[dict[str, Any]]) -> str | None:
 
 
 def _symbol_metadata(item: dict[str, Any]) -> dict[str, Any]:
-    metadata = {key: item[key] for key in ("language", "ecosystem") if key in item}
+    metadata = {key: item[key] for key in ("language", "ecosystem", "dialect", "conditions", "relationships_incomplete") if key in item}
     if (
-        item.get("language") in {"csharp", "go", "rust"}
+        item.get("language") in {"csharp", "go", "rust", "cpp"}
         or str(item.get("path", "")).lower().endswith((".cs", ".go", ".rs"))
     ) and "identity" in item:
         metadata["identity"] = item["identity"]
@@ -72,11 +73,16 @@ def _is_rust_symbol(node: dict[str, Any]) -> bool:
         "module", "struct", "enum", "trait",
     }
 
+def _is_cpp_symbol(node: dict[str, Any]) -> bool:
+    return node.get("language") == "cpp" and node["type"] in {
+        "namespace", "struct", "union", "enum", "type", "constructor", "destructor", "operator", "lambda",
+    }
+
 
 def _is_callable_node(node: dict[str, Any]) -> bool:
     return node["type"] in ("function", "method") or (
-        node.get("language") == "csharp"
-        and node["type"] in ("property", "constructor", "operator", "accessor")
+        (node.get("language") == "csharp" and node["type"] in ("property", "constructor", "operator", "accessor"))
+        or (node.get("language") == "cpp" and node["type"] in ("constructor", "destructor", "operator", "lambda"))
     )
 
 
@@ -102,6 +108,8 @@ class ReviewModel:
     )
     evidence: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    code_paths: dict[str, Any] = field(default_factory=dict)
+    instruction_documents: dict[str, Any] = field(default_factory=dict)
 
     def add_evidence(self, kind: str, data: dict[str, Any]) -> str:
         canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
@@ -166,7 +174,7 @@ class ReviewModel:
         changed_symbols = [
             node for node in nodes
             if (node["type"] in ("class", "function", "method") or _is_csharp_symbol(node)
-                or _is_go_symbol(node) or _is_rust_symbol(node))
+                or _is_go_symbol(node) or _is_rust_symbol(node) or _is_cpp_symbol(node))
             and node["change"] != "unchanged"
         ]
         changed_modules = [
@@ -187,6 +195,8 @@ class ReviewModel:
             for item in sorted(self.evidence, key=lambda item: item["id"])
         }
         return {
+            **({"code_paths": self.code_paths} if self.code_paths else {}),
+            **({"instruction_documents": self.instruction_documents} if self.instruction_documents else {}),
             "source_files": self.source_files,
             "metadata": {
                 "schema_version": 1,
@@ -196,10 +206,16 @@ class ReviewModel:
                 "head_sha": self.repository.get("head"),
                 "generated_at": self.repository.get("generated_at"),
                 "python_loc": self.repository.get("python_loc", 0),
+                **({"analysis_incomplete": True,
+                    "unavailable_languages": self.repository["unavailable_languages"]}
+                   if self.repository.get("analysis_incomplete") else {}),
+                **({"snapshot_exclusions": self.repository["snapshot_exclusions"]}
+                   if "snapshot_exclusions" in self.repository else {}),
                 **({"node_loc": self.repository["node_loc"]} if "node_loc" in self.repository else {}),
                 **({"csharp_loc": self.repository["csharp_loc"]} if "csharp_loc" in self.repository else {}),
                 **({"go_loc": self.repository["go_loc"]} if "go_loc" in self.repository else {}),
                 **({"rust_loc": self.repository["rust_loc"]} if "rust_loc" in self.repository else {}),
+                **({"cpp_loc": self.repository["cpp_loc"]} if "cpp_loc" in self.repository else {}),
                 **(
                     {"review_languages": self.repository["review_languages"]}
                     if "review_languages" in self.repository
@@ -253,6 +269,17 @@ class ReviewModel:
         changes_by_path = {item["path"]: item for item in self.changes}
         coverage = {item["path"]: item for item in self.coverage["files"]}
         changed_coverage = self.coverage.get("changed_lines", {})
+        metric_lines = {
+            path: (
+                sorted(set(changed_coverage.get(path, {}).get("covered_lines", []))),
+                sorted(set(changed_coverage.get(path, {}).get("uncovered_lines", []))),
+                sorted(set(coverage.get(path, {}).get("executable_lines", []))),
+                sorted(set(coverage.get(path, {}).get("covered_lines", []))),
+                sorted(set(changes_by_path.get(path, {}).get("added_lines", []))),
+                sorted(set(changes_by_path.get(path, {}).get("removed_lines", []))),
+            )
+            for path in changes_by_path.keys() | coverage.keys() | changed_coverage.keys()
+        }
         modules = {item["name"]: item for item in self.aggregates["modules"]}
         component_ids = {
             item["name"]: item["id"] for item in self.aggregates["components"]
@@ -277,42 +304,28 @@ class ReviewModel:
             return direct, sorted(visited - set(direct))
 
         def metrics(path: str | None, start: int | None = None, end: int | None = None) -> dict[str, Any]:
-            file_coverage = coverage.get(path or "", {})
-            changed = changed_coverage.get(path or "", {})
-            covered_lines = set(changed.get("covered_lines", []))
-            uncovered_lines = set(changed.get("uncovered_lines", []))
-            if start is not None and end is not None:
-                covered_lines = {line for line in covered_lines if start <= line <= end}
-                uncovered_lines = {line for line in uncovered_lines if start <= line <= end}
-            executable_lines = set(file_coverage.get("executable_lines", []))
-            file_covered_lines = set(file_coverage.get("covered_lines", []))
-            if start is not None and end is not None:
-                executable_lines = {line for line in executable_lines if start <= line <= end}
-                file_covered_lines = {line for line in file_covered_lines if start <= line <= end}
-            executable_count = len(executable_lines)
-            covered_count = len(file_covered_lines)
-            file_change = changes_by_path.get(path or "", {})
-            added_lines = set(file_change.get("added_lines", []))
-            removed_lines = set(file_change.get("removed_lines", []))
-            if start is not None and end is not None:
-                added_lines = {line for line in added_lines if start <= line <= end}
-                removed_lines = {line for line in removed_lines if start <= line <= end}
+            counts = [
+                max(0, bisect_right(lines, end) - bisect_left(lines, start))
+                if start is not None and end is not None else len(lines)
+                for lines in metric_lines.get(path or "", ((), (), (), (), (), ()))
+            ]
+            covered_lines, uncovered_lines, executable_count, covered_count, added_lines, removed_lines = counts
             return {
                 "complexity_base": None,
                 "complexity_current": None,
                 "signature_base": None,
                 "signature_current": None,
                 "coverage_percent": round(100 * covered_count / executable_count, 2) if executable_count else None,
-                "changed_lines_total": len(covered_lines) + len(uncovered_lines),
-                "changed_lines_covered": len(covered_lines),
-                "changed_lines_uncovered": len(uncovered_lines),
+                "changed_lines_total": covered_lines + uncovered_lines,
+                "changed_lines_covered": covered_lines,
+                "changed_lines_uncovered": uncovered_lines,
                 "changed_lines_coverage_percent": (
-                    round(100 * len(covered_lines) / (len(covered_lines) + len(uncovered_lines)), 2)
+                    round(100 * covered_lines / (covered_lines + uncovered_lines), 2)
                     if covered_lines or uncovered_lines else None
                 ),
-                "lines_added": len(added_lines),
-                "lines_removed": len(removed_lines),
-                "lines_changed": len(added_lines) + len(removed_lines),
+                "lines_added": added_lines,
+                "lines_removed": removed_lines,
+                "lines_changed": added_lines + removed_lines,
                 "churn_commits_90d": int(churn.get(path or "", {}).get("commits", 0)),
                 "churn_additions_90d": int(churn.get(path or "", {}).get("additions", 0)),
                 "churn_deletions_90d": int(churn.get(path or "", {}).get("deletions", 0)),
@@ -362,7 +375,8 @@ class ReviewModel:
                 "id": module["id"], "type": "module", "name": module.get("display_name", module["name"]),
                 "parent_id": component_id, "module_id": module["id"],
                 "component_id": component_id, "path": module["path"],
-                "start_line": 1, "end_line": self._line_count(module["path"]),
+                "start_line": 1, "end_line": int(changes_by_path.get(module["path"], {}).get("current_lines")
+                    or changes_by_path.get(module["path"], {}).get("baseline_lines") or 0),
                 "change": module["change"], "metrics": metrics(module["path"]),
                 "signatures": {"base": None, "current": None},
                 **_symbol_metadata(module),
@@ -398,7 +412,7 @@ class ReviewModel:
             })
             result.append({
                 "id": symbol["id"], "type": symbol["kind"], "name": symbol["name"],
-                "display_name": symbol["qualname"] if symbol["kind"] == "method" else symbol["name"],
+                "display_name": symbol["qualname"] if symbol["kind"] == "method" or symbol.get("language") == "cpp" else symbol["name"],
                 "qualified_name": f"{symbol['module']}.{symbol['qualname']}",
                 "parent_id": parent_id, "module_id": module["id"],
                 "component_id": component_id, "path": symbol["path"],
@@ -548,7 +562,8 @@ class ReviewModel:
                                    "detail": f"{metrics['complexity_base']} -> {metrics['complexity_current']}"}
                 )
             elif (
-                metrics["complexity_base"] is None
+                node["change"] == "added"
+                and metrics["complexity_base"] is None
                 and metrics["complexity_current"] is not None
                 and metrics["complexity_current"] >= 8
             ):
@@ -574,7 +589,7 @@ class ReviewModel:
                 )
             if metrics["lines_changed"] >= 25 and (
                 node["type"] in ("module", "class", "function", "method")
-                or _is_csharp_symbol(node) or _is_go_symbol(node) or _is_rust_symbol(node)
+                or _is_csharp_symbol(node) or _is_go_symbol(node) or _is_rust_symbol(node) or _is_cpp_symbol(node)
             ):
                 node["_size_evidence"] = self.add_evidence(
                     "line_delta", {"path": node["path"], "line": node["start_line"],
@@ -631,7 +646,7 @@ class ReviewModel:
             )
             append_finding(
                 node, "signature", "_signature_evidence",
-                "Public symbol contract changed" if _is_csharp_symbol(node) or _is_go_symbol(node) or _is_rust_symbol(node)
+                "Public symbol contract changed" if _is_csharp_symbol(node) or _is_go_symbol(node) or _is_rust_symbol(node) or _is_cpp_symbol(node)
                 else "Public callable contract changed",
                 f"{node['name']} changed its signature with {callers} direct or transitive callers to verify.",
                 50 + min(32, callers * 3),

@@ -4,14 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Agent Review</title>
-    <script>
-      (() => {
-        const param = new URLSearchParams(window.location.search).get("scoutTheme");
-        const theme =
-          param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-        document.documentElement.setAttribute("data-theme", theme);
-      })();
-    </script>
+    <script src="/theme.js"></script>
     <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -24,24 +17,79 @@
             <form id="review-target-form" class="review-target-form">
                 <label for="review-mode">Review</label>
                 <select id="review-mode">
+                    <option value="" selected disabled>Choose review…</option>
                     <option value="worktree">Worktree</option>
                     <option value="commit">Commit</option>
                     <option value="pr">Pull request</option>
                 </select>
                 <select id="review-ref" class="hidden" aria-label="Commit or pull request" disabled></select>
+                <button id="review-list-refresh" class="hidden" type="button" title="Fetch remote commits or reload pull requests added since this list was opened">Refresh list</button>
                 <button id="review-more" class="hidden" type="button">Load more</button>
             </form>
-            <span id="status" class="status">Connecting</span>
+            <button id="status" class="status" type="button" aria-expanded="false" aria-controls="worktree-notice" aria-disabled="true">Connecting</button>
+            <button id="review-command-open" type="button" disabled title="Find review items and keyboard shortcuts (Ctrl+K)">Find / shortcuts</button>
+            <button id="change-repository" class="link-button" type="button">Change repository</button>
             <button id="refresh" type="button" title="Refresh the selected snapshot and rerun AI summaries, custom checks, and package assessments instead of using saved results">Reanalyze</button>
         </div>
     </header>
+    <nav id="review-workflow" class="review-workflow hidden" aria-label="Review workflow">
+        <button id="workflow-overview" type="button" aria-current="page">Overview</button>
+        <button id="workflow-review" type="button">Review</button>
+        <button id="workflow-finish" type="button">Finish</button>
+        <span id="workspace-target" class="workspace-target"></span>
+        <button id="workspace-freshness" class="status stale hidden" type="button" aria-controls="worktree-notice" aria-expanded="false"></button>
+        <button id="workspace-find" type="button">Find</button>
+        <button id="workspace-nav-toggle" type="button" aria-expanded="false" aria-controls="review-navigation">Groups / Files</button>
+        <button id="workspace-return-source" class="hidden" type="button">Return to code</button>
+        <details class="workspace-explore">
+            <summary>Explore</summary>
+            <div>
+                <button id="explore-priorities" type="button">Attention</button>
+                <button id="explore-concerns" type="button">All concerns</button>
+                <button id="explore-groups" type="button">Sections by layer</button>
+                <button id="explore-architecture" type="button">Architecture</button>
+                <button id="explore-paths" type="button">Code paths</button>
+                <button id="explore-packages" type="button">Dependencies</button>
+            </div>
+        </details>
+        <details id="ai-settings" class="workspace-explore ai-settings">
+            <summary aria-label="Settings" title="Settings"><svg aria-hidden="true" viewBox="0 0 16 16" width="16" height="16"><path fill="currentColor" d="M8 0a8.2 8.2 0 0 1 .701.031C9.444.095 9.99.645 10.16 1.29l.288 1.107c.018.066.079.158.212.224.231.114.454.243.668.386.123.082.233.09.299.071l1.103-.303c.644-.176 1.392.021 1.82.63.27.385.506.792.704 1.218.315.675.111 1.422-.364 1.891l-.814.806c-.049.048-.098.147-.088.294.016.257.016.515 0 .772-.01.147.038.246.088.294l.814.806c.475.469.679 1.216.364 1.891a7.977 7.977 0 0 1-.704 1.217c-.428.61-1.176.807-1.82.63l-1.102-.302c-.067-.019-.177-.011-.3.071a5.909 5.909 0 0 1-.668.386c-.133.066-.194.158-.211.224l-.29 1.106c-.168.646-.715 1.196-1.458 1.26a8.006 8.006 0 0 1-1.402 0c-.743-.064-1.289-.614-1.458-1.26l-.289-1.106c-.018-.066-.079-.158-.212-.224a5.738 5.738 0 0 1-.668-.386c-.123-.082-.233-.09-.299-.071l-1.103.303c-.644.176-1.392-.021-1.82-.63a8.12 8.12 0 0 1-.704-1.218c-.315-.675-.111-1.422.363-1.891l.815-.806c.05-.048.098-.147.088-.294a6.214 6.214 0 0 1 0-.772c.01-.147-.038-.246-.088-.294l-.815-.806C.635 6.045.431 5.298.746 4.623a7.92 7.92 0 0 1 .704-1.217c.428-.61 1.176-.807 1.82-.63l1.102.302c.067.019.177.011.3-.071.214-.143.437-.272.668-.386.133-.066.194-.158.211-.224l.29-1.106C6.009.645 6.556.095 7.299.03 7.53.01 7.764 0 8 0Zm-.571 1.525c-.036.003-.108.036-.137.146l-.289 1.105c-.147.561-.549.967-.998 1.189-.173.086-.34.183-.5.29-.417.278-.97.423-1.529.27l-1.103-.303c-.109-.03-.175.016-.195.045-.22.312-.412.644-.573.99-.014.031-.021.11.059.19l.815.806c.411.406.562.957.53 1.456a4.709 4.709 0 0 0 0 .582c.032.499-.119 1.05-.53 1.456l-.815.806c-.081.08-.073.159-.059.19.162.346.353.677.573.989.02.03.085.076.195.046l1.102-.303c.56-.153 1.113-.008 1.53.27.161.107.328.204.501.29.447.222.85.629.997 1.189l.289 1.105c.029.109.101.143.137.146a6.6 6.6 0 0 0 1.142 0c.036-.003.108-.036.137-.146l.289-1.105c.147-.561.549-.967.998-1.189.173-.086.34-.183.5-.29.417-.278.97-.423 1.529-.27l1.103.303c.109.029.175-.016.195-.045.22-.313.411-.644.573-.99.014-.031.021-.11-.059-.19l-.815-.806c-.411-.406-.562-.957-.53-1.456a4.709 4.709 0 0 0 0-.582c-.032-.499.119-1.05.53-1.456l.815-.806c.081-.08.073-.159.059-.19a6.464 6.464 0 0 0-.573-.989c-.02-.03-.085-.076-.195-.046l-1.102.303c-.56.153-1.113.008-1.53-.27a4.44 4.44 0 0 0-.501-.29c-.447-.222-.85-.629-.997-1.189l-.289-1.105c-.029-.11-.101-.143-.137-.146a6.6 6.6 0 0 0-1.142 0ZM11 8a3 3 0 1 1-6 0 3 3 0 0 1 6 0ZM9.5 8a1.5 1.5 0 1 0-3.001.001A1.5 1.5 0 0 0 9.5 8Z"/></svg></summary>
+            <div>
+                <label for="ai-model">Model</label>
+                <select id="ai-model" title="Fusion uses Copilot Auto with Fusion routing when available; otherwise this session's model.">
+                    <option value="session">This session's model</option>
+                    <option value="fusion">Fusion</option>
+                </select>
+                <label for="ai-language">Language</label>
+                <select id="ai-language">
+                    <option value="default">Standard technical</option>
+                    <option value="medium">Medium technical</option>
+                    <option value="plain">Plain English</option>
+                </select>
+                <p id="ai-settings-note" class="muted">Applies to new AI requests. Reanalyze refreshes saved results.</p>
+            </div>
+        </details>
+    </nav>
+    <aside id="review-navigation" class="review-navigation hidden" aria-label="Change navigation">
+        <div class="workspace-nav-tabs" role="group" aria-label="Navigate changes">
+            <button id="workspace-groups" type="button" aria-pressed="true">Groups</button>
+            <button id="workspace-files" type="button" aria-pressed="false">Files</button>
+        </div>
+        <input id="workspace-search" type="search" aria-label="Find a changed file or group" placeholder="Filter changed files…">
+        <p id="workspace-count" class="muted"></p>
+        <p class="workspace-nav-hint muted">Expand a layer to see its files. Select a file to read its diff.</p>
+        <div id="workspace-prefetch" class="hidden"></div>
+        <button id="workspace-group-retry" class="link-button hidden" type="button">Retry grouping</button>
+        <div id="workspace-nav-list"></div>
+    </aside>
+    <div id="workspace-nav-resize" class="pane-resize nav-pane-resize" role="separator" aria-orientation="vertical" tabindex="0"
+        aria-label="Resize the file navigation. Arrow keys resize; double-click resets." aria-controls="review-navigation"></div>
     <main>
         <p id="review-options-status" class="review-options-status" role="status" aria-live="polite"></p>
         <section id="review-picker-notice" class="review-picker-notice hidden" role="status"></section>
         <p id="review-target-label" class="review-target-label"></p>
         <div class="repository-row">
             <p id="repository-identity" class="repository-identity"></p>
-            <button id="change-repository" class="link-button" type="button">Change repository</button>
         </div>
         <section id="connection-notice" class="flash flash-attention worktree-notice hidden" role="status">
             <span>Connection to Agent Review was lost. Retrying automatically. If it does not return, close this canvas tab and reopen Agent Review in this same session. Your code and commits are unaffected.</span>
@@ -49,7 +97,7 @@
         </section>
         <section id="worktree-notice" class="flash flash-attention worktree-notice hidden" role="status" aria-live="polite">
             <span id="worktree-notice-text"></span>
-            <button id="worktree-reanalyze" type="button">Reanalyze</button>
+            <button id="worktree-overview" class="link-button" type="button">Open Overview to reanalyze</button>
         </section>
         <section id="error" class="error hidden" role="alert"></section>
         <section id="analysis-cancelled" class="review-picker-notice hidden" role="status">
@@ -74,6 +122,32 @@
             <h2>No changes to review</h2>
             <p>The selected snapshot has no reviewable changes against its baseline.</p>
         </section>
+        <section id="review-overview" class="review-overview hidden" aria-label="Review overview">
+            <div class="review-overview-top">
+                <div><p class="eyebrow">REVIEW OVERVIEW</p><h2 id="overview-title">Review this change</h2></div>
+                <div class="review-overview-actions">
+                    <button id="overview-start" type="button" disabled>Start review</button>
+                    <button id="overview-files" type="button" disabled>Browse all files</button>
+                </div>
+            </div>
+            <div id="overview-description"></div>
+            <div id="overview-prefetch" class="hidden"></div>
+            <section class="overview-path" aria-labelledby="overview-path-title">
+                <h3 id="overview-path-title" class="overview-path-title">Reading path</h3>
+                <ol id="overview-layers" class="overview-layers"></ol>
+            </section>
+            <p id="overview-progress" class="overview-progress"></p>
+            <p id="overview-stats" class="overview-stats muted"></p>
+            <p id="overview-limitation" class="overview-limitation hidden"></p>
+            <p id="overview-scope" class="muted"></p>
+            <p id="review-progress-status" class="muted" role="status"></p>
+            <button id="review-progress-retry" class="link-button hidden" type="button">Reload saved progress</button>
+            <button id="review-progress-backup" class="link-button hidden" type="button">Save previous browser progress copy</button>
+        </section>
+        <section id="review-finish" class="review-finish hidden" aria-label="Review summary" tabindex="-1"></section>
+        <details id="review-background" class="review-background hidden">
+            <summary>Change summary, intent and advanced checks</summary>
+        <section id="summary" class="summary" aria-label="Change summary"></section>
         <section id="change-brief" class="change-brief" aria-label="Change brief"></section>
         <section id="custom-analyses" class="custom-analyses hidden" aria-label="Custom analyses">
             <div class="custom-heading">
@@ -82,7 +156,7 @@
             </div>
             <div id="custom-results"></div>
         </section>
-        <section id="summary" class="summary" aria-label="Change summary"></section>
+        </details>
         <nav id="breadcrumbs" class="breadcrumbs" aria-label="Review level"></nav>
         <section class="workspace detail-collapsed">
             <aside class="rail">
@@ -106,21 +180,29 @@
                         <h2 id="graph-title">Structural change map</h2>
                         </div>
                     </div>
+                    <button id="graph-close" class="view-close" type="button" aria-label="Close exploration">Close</button>
+                    <div class="view-toolbar">
                     <div class="legend">
                         <span><i class="added"></i>Added</span>
                         <span><i class="modified"></i>Modified</span>
                         <span><i class="removed"></i>Removed</span>
                     </div>
                     <div class="graph-controls">
+                        <button id="impact-view" type="button" aria-pressed="false" disabled>Impact</button>
+                        <button id="sections-view" type="button" aria-pressed="false" disabled>Sections</button>
                         <label><input id="changed-only" type="checkbox" checked> Changed only</label>
                         <input id="review-search" type="search" placeholder="Filter names…" aria-label="Filter review items">
                         <button id="detail-toggle" type="button" aria-pressed="false">Show details</button>
+                    </div>
                     </div>
                 </div>
                 <div id="graph" class="graph" aria-label="Interactive change graph"></div>
             </section>
             <aside id="detail-pane" class="detail">
-                <button id="detail-close" class="pane-close" type="button" aria-label="Close details pane">×</button>
+                <div class="detail-pane-heading">
+                    <button id="detail-back" class="view-back" type="button" aria-label="Back from details">← Back</button>
+                    <button id="detail-close" class="view-close" type="button" aria-label="Close details pane">Close</button>
+                </div>
                 <div id="detail">
                     <div class="empty-state">
                         <span class="focus-mark">◎</span>
@@ -134,31 +216,78 @@
             <div class="panel-heading">
                 <div class="source-heading">
                     <div class="source-nav" role="group" aria-label="Source navigation">
-                        <button id="source-back" class="source-nav-button" type="button" aria-label="Back" title="Back (Alt+←)" disabled>←</button>
+                        <button id="source-back" class="source-nav-button view-back" type="button" aria-label="Back" title="Back (Alt+←)" disabled>← Back</button>
                         <button id="source-forward" class="source-nav-button" type="button" aria-label="Forward" title="Forward (Alt+→)" disabled>→</button>
                     </div>
-                    <div><p class="eyebrow">SOURCE / DIFF</p><h2 id="source-title"></h2></div>
+                    <div><p class="eyebrow">SOURCE / DIFF</p><h2 id="source-title"></h2><p id="source-position" class="source-position muted"></p></div>
                 </div>
+                <button id="source-close" class="source-close view-close" type="button" aria-label="Close source review">Close</button>
                 <div class="tablist" role="tablist">
                     <button class="tab active" data-tab="diff" type="button">Diff</button>
                     <button class="tab" data-tab="current" type="button">Current</button>
                     <button class="tab" data-tab="base" type="button">Base</button>
-                    <button id="source-close" class="source-close" type="button" aria-label="Close source review">Close ×</button>
+                    <span id="diff-layout" class="diff-layout hidden" role="group" aria-label="Diff layout (U)">
+                        <button type="button" data-layout="unified" aria-pressed="true" title="Unified diff (U toggles)">Unified</button>
+                        <button type="button" data-layout="split" aria-pressed="false" title="Split diff: base left, current right (U toggles)">Split</button>
+                    </span>
+                    <button id="source-impact" type="button">Impact</button>
+                    <button id="source-section" type="button">Layer</button>
+                    <button id="source-focus" type="button" aria-pressed="false" disabled>Focus code</button>
+                    <button id="source-location" type="button" disabled title="Copy a local link pinned to this source snapshot and location">Copy location</button>
                 </div>
             </div>
+            <div class="workspace-reading-tools" role="group" aria-label="Reading pane">
+                <button id="workspace-code" type="button" aria-pressed="true">Code</button>
+                <button id="workspace-context" type="button" aria-pressed="false" aria-label="Context / Discussion">Context<span class="narrow-hide"> / Discussion</span></button>
+                <button id="workspace-discuss" type="button">Ask about this</button>
+                <button id="workspace-comment" type="button" title="Comment on the line you are reading (C), or click a line number">Comment</button>
+                <span id="workspace-group-label" class="muted"></span>
+            </div>
             <p id="source-context-notice" class="muted source-context-notice hidden" role="status"></p>
-            <section id="source-risk" class="source-risk hidden" aria-label="Review priority"></section>
+            <div id="source-strip" class="source-strip hidden">
+                <button id="source-strip-toggle" class="source-strip-toggle" type="button" aria-expanded="false" aria-controls="source-strip-body"></button>
+                <div id="source-strip-body" class="source-strip-body hidden">
+                    <p id="source-coverage" class="source-coverage hidden" role="note"></p>
+                    <section id="source-risk" class="source-risk hidden" aria-label="Review priority"></section>
+                </div>
+            </div>
             <div class="source-body">
                 <div class="code-frame">
-                    <div id="source" class="code-view" aria-label="Source and diff"></div>
+                    <div id="source" class="code-view" role="region" tabindex="0" aria-label="Source and diff"></div>
                     <div id="source-ruler" class="code-ruler hidden" role="navigation" aria-label="Changes in this file"></div>
                 </div>
                 <div class="source-side">
-                    <aside id="source-provenance" class="source-provenance hidden" aria-live="polite"></aside>
+                    <div class="discussion-tabs" role="group" aria-label="Source context">
+                        <button id="show-evidence" type="button" aria-pressed="true">Evidence</button>
+                        <button id="show-discussion" type="button" aria-pressed="false">Discussion</button>
+                    </div>
+                    <aside id="item-discussion" class="item-discussion hidden" aria-label="Item discussion"></aside>
                     <aside id="source-annotation" class="source-annotation hidden" aria-live="polite"></aside>
+                    <details id="source-origin" class="source-origin">
+                        <summary>Originating context</summary>
+                        <aside id="source-provenance" class="source-provenance hidden" aria-live="polite"></aside>
+                    </details>
+                    <aside id="source-review-context" class="source-review-context hidden" aria-label="Review context"></aside>
                     <aside id="source-decisions" class="source-decisions hidden" aria-label="Code path changes"></aside>
                 </div>
+                <div id="source-side-resize" class="pane-resize side-pane-resize hidden" role="separator" aria-orientation="vertical" tabindex="0"
+                    aria-label="Resize the evidence pane. Arrow keys resize; double-click resets."></div>
             </div>
+            <form id="file-review-form" class="file-review-footer hidden">
+                <label><span id="file-review-label">Whole-file review</span>
+                    <select id="file-review-disposition" aria-label="Whole-file decision">
+                        <option value="pending">Not reviewed</option>
+                        <option value="reviewed">Reviewed</option>
+                        <option value="follow-up">Needs follow-up</option>
+                    </select>
+                </label>
+                <input id="file-review-note" type="text" maxlength="500" aria-label="Whole-file review note" placeholder="Optional file review note">
+                <button id="file-review-save" type="button">Save decision</button>
+                <button id="file-review-open-next" type="button">Next file</button>
+                <button id="file-review-next" type="submit">Mark file reviewed &amp; next</button>
+                <span id="file-review-status" class="muted" role="status"></span>
+                <button id="file-review-retry" class="link-button hidden" type="button">Reload saved progress</button>
+            </form>
         </section>
         <section id="session-history-panel" class="session-history-panel hidden">
             <div class="panel-heading">
@@ -167,11 +296,80 @@
                     <h2 id="session-history-title">Session transcript</h2>
                     <p id="session-history-meta" class="muted"></p>
                 </div>
-                <button id="session-history-close" class="source-close" type="button">Close ×</button>
+                <button id="session-history-close" class="source-close view-close" type="button" aria-label="Close session history">Close</button>
             </div>
             <div id="session-transcript" class="session-transcript"></div>
         </section>
     </main>
+    <dialog id="review-handoff" class="prompt-manager review-handoff" aria-labelledby="handoff-title">
+        <div class="custom-heading">
+            <h2 id="handoff-title">Review handoff</h2>
+            <button id="handoff-close" type="button">Close</button>
+        </div>
+        <p>Preview saved decisions before exporting or submitting. File names, human notes and the marked AI layer titles and one-line layer summaries are included. Source bodies, per-item AI explanations, prompts and discussion transcripts are not included. Unsaved drafts are not exported.</p>
+        <p id="handoff-status" class="muted" role="status"></p>
+        <p id="handoff-error" class="error hidden" role="alert"></p>
+        <button id="handoff-refresh" type="button">Refresh preview</button>
+        <label for="handoff-markdown">Exact Markdown summary / PR review body</label>
+        <textarea id="handoff-markdown" rows="12" readonly spellcheck="false"></textarea>
+        <div class="handoff-actions">
+            <button id="handoff-markdown-save" type="button" disabled>Download Markdown</button>
+            <button id="handoff-state-save" type="button" disabled>Download decision state JSON</button>
+        </div>
+        <details>
+            <summary>Portable state and reopening requirements</summary>
+            <p>JSON contains decisions and a reading point, not source or a canvas link. Open the original saved snapshot and import there. Commit reviews need the original Git objects; worktree reviews need the original saved worktree source. Import verifies exact content, never newer worktree files.</p>
+            <pre id="handoff-state-preview"></pre>
+        </details>
+        <section id="handoff-provider-section" class="handoff-section" aria-label="Submit review to the pull request">
+            <h3>Submit review to the pull request</h3>
+            <p id="handoff-provider" class="muted"></p>
+            <label for="handoff-summary">Your review summary <span class="muted">(optional; posted first, above the Agent Review summary)</span></label>
+            <textarea id="handoff-summary" rows="4" maxlength="10000" placeholder="Leave your overall feedback for the author."></textarea>
+            <fieldset id="handoff-verdict" class="handoff-verdict">
+                <legend>Verdict</legend>
+                <label><input type="radio" name="handoff-verdict" value="COMMENT" checked> Comment <span class="muted">— feedback without a verdict</span></label>
+                <label><input type="radio" name="handoff-verdict" value="APPROVE"> Approve <span class="muted">— ready to merge</span></label>
+                <label><input type="radio" name="handoff-verdict" value="REQUEST_CHANGES"> Request changes <span class="muted">— must be addressed before merging</span></label>
+            </fieldset>
+            <p id="handoff-provider-status" class="muted" role="status" tabindex="-1"></p>
+            <p id="handoff-provider-error" class="error hidden" role="alert"></p>
+            <label class="handoff-confirm"><input id="handoff-confirm" type="checkbox" disabled> <span id="handoff-confirm-text">I reviewed this summary and the line comments and choose to post them under my GitHub identity.</span></label>
+            <button id="handoff-submit" class="handoff-primary" type="button" disabled>Submit review</button>
+        </section>
+        <section class="handoff-section" aria-label="Import decisions">
+            <h3>Import matching review decisions</h3>
+            <p>Preview first. Existing different decisions or notes are never overwritten. Current reading position is retained when present.</p>
+            <label for="handoff-import-file">Agent Review decision state JSON (up to 1 MiB)</label>
+            <input id="handoff-import-file" type="file" accept=".json,application/json">
+            <p id="handoff-import-preview" class="muted" role="status"></p>
+            <p id="handoff-import-error" class="error hidden" role="alert"></p>
+            <button id="handoff-import-confirm" type="button" disabled>Confirm decision import</button>
+        </section>
+    </dialog>
+    <dialog id="group-review-dialog" class="prompt-manager" aria-labelledby="group-review-title">
+        <div class="custom-heading">
+            <h2 id="group-review-title">Mark group files reviewed</h2>
+            <button id="group-review-close" type="button">Close</button>
+        </div>
+        <p id="group-review-scope"></p>
+        <p id="group-review-error" class="error hidden" role="alert"></p>
+        <p class="muted">This records your whole-file review decisions. It does not run tests, resolve concerns, or establish correctness.</p>
+        <button id="group-review-confirm" type="button">Mark all group files reviewed</button>
+        <button id="group-review-cancel" type="button">Cancel</button>
+    </dialog>
+    <dialog id="review-command-palette" class="prompt-manager" aria-labelledby="review-command-title">
+        <div class="custom-heading">
+            <h2 id="review-command-title">Find in this review</h2>
+            <button id="review-command-close" type="button">Close</button>
+        </div>
+        <label for="review-command-query">File, symbol, or finding</label>
+        <input id="review-command-query" type="search" maxlength="500" placeholder="Find a changed file, source symbol, or priority signal…">
+        <p id="review-command-count" class="muted" role="status"></p>
+        <ul id="review-command-results" class="review-command-results"></ul>
+        <p class="muted">Searches this snapshot's file names, symbols, and findings—not full source text. Results are capped at 30.</p>
+        <p class="muted">With review or source focus: J/K next/previous item, M mark the open file reviewed and go to the next, U switch unified/split diff (wide windows), C comment on the line you are reading (or click a changed line's number), A ask, I impact, F focus code. Ctrl+K opens this finder outside editable fields. Back (Alt+←) retraces your reading or exploration steps. Close returns to the view's opener. Escape exits focus mode, clears a highlighted range, or closes an exploration overlay; use Close to close a file in Review. Ctrl+Enter sends a discussion question or saves a line comment.</p>
+    </dialog>
     <dialog id="repository-picker" class="prompt-manager" aria-labelledby="repository-picker-title">
         <div class="custom-heading">
             <h2 id="repository-picker-title">Choose repository</h2>

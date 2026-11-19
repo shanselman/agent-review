@@ -1,3 +1,4 @@
+import { openChangeDetails } from "./review-details-helper.mjs";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { execFile } from "node:child_process";
@@ -8,6 +9,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ReviewState } from "../../review-state.mjs";
 import { startReviewServer } from "../../server.mjs";
+const openChangeSummary = async (page) => {
+    const details = page.locator("#review-background");
+    if (await details.isVisible() && !await details.evaluate((element) => element.open)) await details.locator(":scope > summary").click();
+};
 
 const require = createRequire(process.env.AGENT_REVIEW_BROWSER_PACKAGE || import.meta.url);
 const { chromium } = require("playwright-core");
@@ -77,6 +82,8 @@ try {
             await route.continue();
         });
         await page.goto(`${server.url}?scoutTheme=${theme}`);
+        await openChangeDetails(page);
+
         await page.locator("#change-brief .brief-ai").waitFor();
         assert.equal(await page.locator("#change-brief .review-heading").textContent(), "Uncommitted changes");
         await page.locator(".review-plan-row").first().waitFor();
@@ -101,7 +108,8 @@ try {
             }, { variable: token, property });
             assert.ok(colors.every((color) => color.actual === color.expected), `${theme}: ${selector} uses its semantic color`);
         }
-        assert.match(await page.locator(".quality-warning").textContent(), /Coverage unavailable.*Provide Python coverage\.json\/coverage\.xml/);
+        assert.match(await page.locator("#overview-limitation").textContent(), /Coverage unavailable.*Provide Python coverage\.json\/coverage\.xml/);
+        await openChangeSummary(page);
         const tiles = await page.locator("#summary .metric").evaluateAll((cards) => {
             const probe = document.createElement("span");
             probe.style.color = "var(--cp-text-muted)";
@@ -120,6 +128,7 @@ try {
             assert.equal(tile.empty, tile.zero, `${theme}: ${tile.label} is greyed exactly when it has no changes`);
             if (tile.empty) assert.ok(tile.mutedCounts, `${theme}: ${tile.label} counts are muted`);
         }
+        await openChangeSummary(page);
         assert.match(await page.locator("#summary .metric").filter({ hasText: "Architecture edges" }).textContent(),
             /\+0\/−0Architecture edgesNo module relationship changes/, "edge detail follows the module-level count");
         assert.match(await page.locator("#repository-identity").textContent(), /review-presentation-.*Base [a-f0-9]{8}/);
@@ -153,6 +162,7 @@ try {
             assert.ok(queueGeometry.length > 0, "fixture has review queue cards");
             assert.ok(queueGeometry.every((item) => item.fits && item.scrollWidth <= item.clientWidth + 1),
                 `${theme}: queue text and priorities fit at ${width}px: ${JSON.stringify(queueGeometry)}`);
+            await openChangeSummary(page);
             const metrics = await page.locator("#summary .metric").evaluateAll((cards) => {
                 cards[2].querySelector("small").textContent = "Largest: src.workflow_service.scheduling → croniter";
                 return cards.map((card) => ({
@@ -169,7 +179,9 @@ try {
                     }
                 }
             }
+            await openChangeSummary(page);
             assert.equal(await page.locator("#summary .metric").filter({ hasText: "Files" }).locator(".delta-modified").textContent(), "~1");
+            await openChangeSummary(page);
             assert.equal(await page.locator("#summary .metric").filter({ hasText: "Packages" }).locator(".delta-modified").textContent(), "~0");
         }
         await page.setViewportSize({ width: 1440, height: 1000 });
@@ -181,10 +193,11 @@ try {
         assert.equal(new Set(panels.map((panel) => panel.border)).size, 1, "summary panels use neutral Primer borders");
         assert.equal(new Set(panels.map((panel) => panel.background)).size, 1, "summary panels have neutral surfaces, not decorative tints");
         assert.equal(new Set(panels.map((panel) => panel.heading)).size, 3, "semantic color is limited to the section headings");
+        await openChangeSummary(page);
         await page.locator("#summary .metric").filter({ hasText: "Packages" }).click();
         await page.locator(".stat-grid").waitFor();
         assert.match(await page.locator("#packages").textContent(), /Version 25\.0/);
-        assert.match(await page.locator("#attention .impact-score").first().textContent(), /Priority \d+\/100/);
+        assert.match(await page.locator("#attention .impact-score").first().textContent(), /Static impact \d+\/100/);
         const panel = await page.locator("#package-detail").textContent();
         assert.match(panel, /Manifest changes are reviewed even when no static usage is resolved/);
         assert.match(panel, /Static usage locations \(0\)/);
@@ -257,12 +270,15 @@ try {
         assert.equal(after.height, header.height, "header height is stable on PR failure");
         await page.selectOption("#review-mode", "worktree");
         await page.waitForFunction(() => document.querySelector("#status").textContent === "Saved review");
+        await openChangeDetails(page);
+
         await page.locator("#change-brief .brief-ai").waitFor();
         assert.equal(summaries, generated, "switching reuses the previous AI summary");
         assert.equal(await page.locator("#graph-title").textContent(), "Risk-first walkthrough");
         assert.equal(await page.locator(".workspace").evaluate((node) => node.classList.contains("package-mode")), false);
         assert.equal(await page.locator(".detail").isVisible(), false);
         assert.equal(await page.locator("#attention").isVisible(), true);
+        await openChangeSummary(page);
         await page.locator("#summary .metric").filter({ hasText: "Packages" }).click();
         await page.locator(".stat-grid").waitFor();
         assert.equal(explanations, 1, "saved package explanation is reused");
@@ -275,6 +291,8 @@ try {
     }
     const cachePage = await browser.newPage();
     await cachePage.goto(server.url);
+    await openChangeDetails(cachePage);
+
     await cachePage.locator("#change-brief .brief-ai").waitFor();
     let releaseSelection, selectionStarted;
     const selectionGate = new Promise((resolve) => { releaseSelection = resolve; });
@@ -298,10 +316,12 @@ try {
     releaseSelection();
     await cachePage.waitForFunction(() => !document.querySelector("#review-ref").disabled);
     assert.equal(await cachePage.locator("#review-options-status").textContent(), "", "successful commit loading has no total-count label");
+    await openChangeDetails(cachePage);
+
     await cachePage.locator("#change-brief .brief-ai").waitFor();
     assert.equal(state.reviewTarget.mode, "commit");
-    assert.match(await cachePage.locator(".quality-warning").textContent(), /historical snapshot.*not applied to commit or PR/);
-    assert.doesNotMatch(await cachePage.locator(".quality-warning").textContent(), /1 analyzer warning/);
+    assert.match(await cachePage.locator("#overview-limitation").textContent(), /historical snapshot.*not applied to commit or PR/);
+    assert.doesNotMatch(await cachePage.locator("#overview-limitation").textContent(), /1 analyzer warning/);
     const cachedSummaries = summaries;
     await cachePage.selectOption("#review-mode", "worktree");
     await cachePage.waitForFunction(() => document.querySelector("#status").textContent === "Saved review");
@@ -320,10 +340,10 @@ try {
     const originalAttention = state.model.attention;
     const areas = state.model.nodes.filter((node) => ["module", "class", "method", "function"].includes(node.kind)).slice(0, 5);
     assert.equal(areas.length, 5);
-    state.model.attention = areas.map((node, index) => ({
+    state.model = { ...state.model, attention: areas.map((node, index) => ({
         id: `test:area:${index}`, node_id: node.id, title: "Large implementation change",
         reason: "Inspect this changed area.", impact_score: 50 - index, evidence_ids: [],
-    }));
+    })) };
     state.broadcast();
     await cachePage.locator('#attention .review-card[data-item-id="group:size"]').click();
     assert.equal(await cachePage.locator("#graph-title").textContent(), "Large changes · 5 areas");
@@ -337,13 +357,15 @@ try {
     await rows.first().click();
     await cachePage.locator("#source-panel").waitFor();
     assert.ok((await cachePage.locator("#source-title").textContent()).startsWith(areas[0].path));
-    state.model.attention = originalAttention;
+    state.model = { ...state.model, attention: originalAttention };
     state.broadcast();
     await cachePage.close();
     console.log("PASS saved commit autoload and all five grouped areas individually visible with source navigation");
     const linesPage = await browser.newPage();
     await linesPage.goto(server.url);
+    await openChangeSummary(linesPage);
     await linesPage.locator("#summary .metric").first().waitFor();
+    await openChangeSummary(linesPage);
     await linesPage.locator("#summary .metric").filter({ hasText: "Lines", exact: false }).filter({ hasNotText: "Files" }).first().click();
     assert.equal(await linesPage.locator("#graph-title").textContent(), "Lines changed by file");
     const fileRows = linesPage.locator("#graph .collection-row");
@@ -381,6 +403,8 @@ try {
     assert.equal(customRuns, 0);
     await writeFile(join(repo, "health.py"), "class HealthCheck:\n    name: str\n    severity: str\n    passed: bool\n    message: str\n    details: dict\n    restored: bool\n");
     await cleanState.refresh();
+    await openChangeDetails(cleanPage);
+
     await cleanPage.locator("#change-brief .brief-ai").waitFor();
     assert.equal(await cleanPage.locator("#clean-review").isVisible(), false);
     assert.equal(await cleanPage.locator(".workspace").isVisible(), true);
@@ -393,6 +417,7 @@ try {
     const emptyCommit = (await git("rev-parse", "HEAD")).stdout.trim();
     const emptyPage = await browser.newPage();
     await emptyPage.goto(server.url);
+    await openChangeSummary(emptyPage);
     await emptyPage.locator("#summary .metric").first().waitFor();
     const beforeEmpty = cleanSummaries;
     await emptyPage.selectOption("#review-mode", "commit");

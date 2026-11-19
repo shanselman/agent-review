@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -10,9 +11,11 @@ namespace AgentReview;
 // dotnet build <trusted-extension>\dotnet-analyzer\AgentReview.DotnetAnalyzer.csproj -c Release
 //   /p:ImportDirectoryBuildProps=false /p:ImportDirectoryBuildTargets=false
 // The project disables those imports BEFORE explicit SDK props/targets imports, plus ancestor
-// Directory.Packages.props and NuGet feed auditing (no package dependencies). Preparation must
-// still run outside reviewed repositories (SDK/global.json/NuGet configuration/environment
-// resolution belongs to the trusted build host); deploy copied compiled output to the scanner.
+// Directory.Packages.props and NuGet feed auditing (source builds have no package dependencies;
+// release bundles set AgentReviewPortableRoslyn to use the pinned portable Roslyn package).
+// Preparation must still run outside reviewed repositories (SDK/global.json/NuGet
+// configuration/environment resolution belongs to the trusted build host); deploy copied
+// compiled output to the scanner.
 // Protocol: one JSON document on stdin or --input <request.json>, one JSON document on stdout.
 // Only the explicitly supplied request file is read; never reads reviewed source/project files.
 // --self-test runs dependency-free protocol, graph, configuration and decision regression tests.
@@ -47,18 +50,31 @@ namespace AgentReview;
 // verification.tests uses VSTest FQNs for id/full_name, relative csproj for project, and a direct/
 // reachable link. Test contexts are merged across TFMs; test sources/projects are not production
 // decision callables. Property accessors are grouped under the property's documentation ID.
-// Bounds: 32 Mi input characters; 2000 files, 128 project/TFM contexts, 64 Mi context characters,
+// Bounds: 128 Mi request JSON characters; 32 Mi source characters per snapshot;
+// 2000 files, 128 project/TFM contexts, 64 Mi context characters,
 // 20000 symbols and 100000 edges per snapshot; 1000 callables, 256 decisions each, 10000 diff entries; 200 tests,
 // 5 links per entry, 128 nested syntax decision scopes. Exceeding input bounds is an error;
 // analysis caps set limited and warn.
 // XML supports literal properties, TargetFramework equality conditions, snapshot Compile globs,
-// exact-TFM project references, defines/LangVersion/Nullable/AllowUnsafeBlocks/checked/OutputType.
-// Unsupported evaluation, imports, SDK implicit usings, package/assembly references and missing
+// exact or unambiguous compatible modern-.NET project references, single-context unknown-TFM
+// fallback (warned), defines/LangVersion/Nullable/AllowUnsafeBlocks/checked/OutputType.
+// Supported literal properties and namespace Using items from nearest saved Directory.Build.props
+// precede project properties. Imports/targets still never evaluate. Changed declarations,
+// callables, and relevant consumer/test contexts precede budgets; retained partials stay merged.
+// One-sided unchanged declaration omissions never become additions/removals. Limited relationships
+// are lower bounds, and verification.limited includes unresolved snapshot configuration.
+// Literal Microsoft.NET.Sdk implicit usings use the standard namespaces. Unsigned literal
+// InternalsVisibleTo items map unique supplied project names to snapshot assembly identities.
+// Unsupported evaluation, imports, other SDK-generated source, package/assembly references and missing
 // source are explicitly incomplete. TPA references are helper runtime APIs, not target contracts.
 // Unassigned sources are syntax-only. Lambdas, dynamic/reflection dispatch, generators, arbitrary
 // expression effects, interprocedural exception/flow analysis and execution coverage are omitted.
 // The bounded process-local syntax LRU (256 trees/64 Mi estimated bytes) is keyed by content, path,
-// parse configuration and compiler version. Semantic compilations are always rebuilt snapshot-wide.
+// parse configuration and compiler version. Source-only comparisons select changed projects,
+// transitive consumers/tests and their dependency closure before parsing/compilation, across both
+// snapshots and all TFMs. Unrelated contexts are explicitly omitted/limited. Configuration changes
+// and uncertain source/reference membership retain the full graph. Identical snapshots reuse one
+// compilation without changing identity output. progress=true emits project/stage messages on stderr.
 // AGENT_REVIEW_DOTNET_CACHE sets the caller-owned persistent root. Otherwise default to
 // AGENT_REVIEW_CACHE_DIR\dotnet-facts, or <home>\.copilot\agent-review\file-cache\dotnet-facts.
 // request.use_cache=false disables persistence regardless of env; an empty explicit root also
@@ -69,9 +85,12 @@ namespace AgentReview;
 // SHA256 keys include supplied source content, path, parse options, Roslyn MVID/version and helper
 // extractor MVID/schema version. Cache hits reuse syntax decisions, not semantic relationships,
 // symbol IDs, diffs or test links. Roslyn trees are not serialized; parsing and all semantic
-// compilations/relationships are always rebuilt. Bad/unavailable entries fall back to fresh facts.
+// selected compilations/relationships are rebuilt (identical snapshot pairs share one build).
+// Bad/unavailable entries fall back to fresh facts.
 internal static class Program
 {
+    internal const int MaxRequestChars = 128 * 1024 * 1024;
+
     internal static readonly JsonSerializerOptions Json = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
@@ -90,35 +109,40 @@ internal static class Program
         {
             using var requestFile = args.Length == 2 ? new StreamReader(args[1], detectEncodingFromByteOrderMarks: true) : null;
             var reader = (TextReader?)requestFile ?? Console.In;
-            // Limit the protocol before allocating trees, not merely after parsing JSON.
-            var input = new char[Analyzer.MaxInputChars + 1];
-            var length = 0;
-            while (length < input.Length)
-            {
-                var read = reader.Read(input, length, input.Length - length);
-                if (read == 0) break;
-                length += read;
-            }
-            if (length > Analyzer.MaxInputChars) throw new InvalidDataException("Input exceeds 32 Mi characters.");
-            var request = JsonSerializer.Deserialize<Request>(input.AsSpan(0, length), Json)
+            var request = JsonSerializer.Deserialize<Request>(ReadInput(reader, MaxRequestChars), Json)
                 ?? throw new InvalidDataException("Expected a snapshot request.");
             Console.WriteLine(JsonSerializer.Serialize(Analyzer.Analyze(request), Json));
             return 0;
         }
-        catch (Exception error) when (error is JsonException or IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception error) when (error is JsonException or IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException)
         {
             Console.Error.WriteLine($"agent-review dotnet: {error.Message}");
             return 2;
         }
     }
+
+    internal static string ReadInput(TextReader reader, int maxCharacters)
+    {
+        // Bound JSON before deserialization, without allocating the full limit for small requests.
+        var input = new StringBuilder();
+        var buffer = new char[8192];
+        while (true)
+        {
+            var read = reader.Read(buffer, 0, Math.Min(buffer.Length, maxCharacters - input.Length + 1));
+            if (read == 0) return input.ToString();
+            if (read > maxCharacters - input.Length)
+                throw new InvalidDataException($"Request JSON exceeds {maxCharacters / (1024 * 1024)} Mi characters; reduce snapshot scope.");
+            input.Append(buffer, 0, read);
+        }
+    }
 }
 
 internal sealed record Request(Dictionary<string, string>? Baseline, Dictionary<string, string>? Current,
-    string? Mode = null, bool UseCache = true);
+    string? Mode = null, bool UseCache = true, bool Progress = false);
 internal sealed record SymbolRecord(string Id, string Name, string Qualname, string Path, int Line,
     int EndLine, string Kind, string Module, string Classification, string Language = "csharp",
     string Ecosystem = "nuget", string? ParentId = null, List<DeclarationSpan>? Declarations = null,
-    List<DeclarationSpan>? BaselineDeclarations = null)
+    List<DeclarationSpan>? BaselineDeclarations = null, bool RelationshipsIncomplete = false)
 {
     public string? ParentIdentity => ParentId;
 }
@@ -129,12 +153,13 @@ internal sealed record AnalysisResult(List<SymbolRecord> Symbols, List<EdgeRecor
     List<string> Warnings, CodePaths CodePaths);
 internal sealed record CodePaths(List<CallableChanges> Callables, Dictionary<string, int> Totals,
     bool Limited, List<string> Warnings, Verification Verification);
-internal sealed record Verification(List<TestRecord> Tests, int OmittedTests, int TestFilesExamined, bool Limited);
+internal sealed record Verification(List<TestRecord> Tests, int OmittedTests, int TestFilesExamined, bool Limited,
+    int OmittedTestCandidates = 0);
 internal sealed record TestRecord(string Id, string FullName, string Project, string Link,
     string Name, string Path, int Line, List<string> Calls, List<string> Callables,
     List<AssertionRecord> Assertions, string DeclarationRecognition, string? Via = null);
 internal sealed record AssertionRecord(int Line, string Text, string Kind, string Recognition = "semantic");
-internal sealed record Evidence(string Level, List<TestEvidence> Tests, int OmittedTests = 0);
+internal sealed record Evidence(string Level, List<TestEvidence> Tests, int OmittedTests = 0, bool Limited = false);
 internal sealed record TestEvidence(string Id, string Path, int Line, string? Match = null,
     AssertionRecord? Assertion = null, int? Ambiguous = null, string? Via = null, string? Project = null);
 internal sealed record Decision(string Kind, string Outcome, string? Value, List<string> When,

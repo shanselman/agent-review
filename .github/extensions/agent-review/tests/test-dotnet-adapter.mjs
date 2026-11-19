@@ -7,8 +7,9 @@ import { packageEvidenceLinks } from "../web/package-presentation.mjs";
 import { callableName, callablesForSubject, pathEvidence } from "../web/decision-map.mjs";
 import { parseSourceReference } from "../web/source-references.mjs";
 import { resolveSymbolReference } from "../web/symbol-links.mjs";
-import { ReviewState } from "../review-state.mjs";
+import { ReviewState, runDecisionExtractor } from "../review-state.mjs";
 import { isReviewSymbol } from "../web/languages.mjs";
+import { mergeCodePathMaps } from "../language-adapters.mjs";
 
 test("C# requests contain saved baseline and current configuration, never live files", () => {
     const model = { symbols: [{ language: "csharp", kind: "method", classification: "modified" }],
@@ -20,6 +21,55 @@ test("C# requests contain saved baseline and current configuration, never live f
         current: { "App.cs": "new", "App.csproj": "<Project/>" },
     });
     assert.equal(DOTNET_REVIEW_ADAPTER.buildCodePathRequest({ symbols: [] }), null);
+});
+
+test("C# requests retain compiler inputs but exclude unrelated mixed-repository source and assets", () => {
+    const inputs = ["src/App.CS", "src/App.CSPROJ", "App.sln", "App.slnx", "Directory.Build.props",
+        "Directory.Packages.props", "src/Custom.targets", "global.json", "src/NuGet.Config", "src/.editorconfig"];
+    const excluded = ["main.py", "ui/app.ts", "data/large.json", "assets/strings.resx",
+        "assets/logo.svg", "nested/not-global.json", "nuget.config.txt", "global.json/notes.txt"];
+    const source_files = Object.fromEntries([...inputs, ...excluded]
+        .map((path) => [path, { baseline: "saved base", current: "saved current" }]));
+    const request = DOTNET_REVIEW_ADAPTER.buildCodePathRequest({
+        symbols: [{ language: "csharp", kind: "method", classification: "modified" }], source_files,
+    });
+    assert.deepEqual(Object.keys(request.baseline), inputs);
+    assert.deepEqual(Object.keys(request.current), inputs);
+});
+
+test("C# paths reuse the scan's immutable compiler result without another helper process", async () => {
+    const paths = { callables: [], totals: {}, limited: true, warnings: ["Saved compiler limit"] };
+    const request = DOTNET_REVIEW_ADAPTER.buildCodePathRequest({
+        symbols: [{ language: "csharp", kind: "method", classification: "modified" }],
+        source_files: {}, code_paths: { csharp: paths },
+    });
+
+    assert.deepEqual(request, { precomputed: paths });
+    assert.deepEqual(await runDecisionExtractor({ ...request, adapter_id: "csharp" }),
+        { ...paths, adapter_id: "csharp" });
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(runDecisionExtractor(request, { signal: controller.signal }), { name: "AbortError" });
+});
+
+test("constructor/local-function reviews and cached C# test candidate limits remain explicit", () => {
+    const paths = { callables: [], totals: {}, limited: true, warnings: [],
+        verification: { tests: [], omitted_tests: 7, limited: true } };
+    for (const kind of ["constructor", "function", "accessor"]) {
+        const request = DOTNET_REVIEW_ADAPTER.buildCodePathRequest({
+            symbols: [{ language: "csharp", kind, classification: "modified" }], code_paths: { csharp: paths },
+        });
+        assert.equal(request.precomputed.verification.omitted_tests, 0);
+        assert.equal(request.precomputed.verification.omitted_test_candidates, 7);
+    }
+    assert.equal(paths.verification.omitted_tests, 7, "older saved reports are not mutated");
+    const combined = mergeCodePathMaps([
+        { adapter_id: "csharp", callables: [], warnings: [], verification: {
+            tests: [], omitted_tests: 0, omitted_test_candidates: 7, limited: true } },
+        { adapter_id: "python", callables: [], warnings: [], verification: { tests: [], omitted_tests: 2 } },
+    ]);
+    assert.equal(combined.verification.omitted_tests, 2);
+    assert.equal(combined.verification.omitted_test_candidates, 7);
 });
 
 test("xUnit plans use exact filters, surface build/restore, and reject outside project paths", () => {
@@ -37,6 +87,19 @@ test("xUnit plans use exact filters, surface build/restore, and reject outside p
         { ...plan, tests: ["Tests.One", "Tests.Two"] }), /^& 'C:\\Program Files\\dotnet\\dotnet.exe'/);
     assert.match(formatDotnetTestCommand({ executable: "dotnet" }, { ...plan, tests: ["Tests.One", "Tests.Two"] }),
         /'FullyQualifiedName=Tests.One\|FullyQualifiedName=Tests.Two'/);
+});
+
+test("bounded C# analysis cannot present absent links as no callers or tests", () => {
+    for (const map of [{ limited: true }, { verification: { limited: true } }]) {
+        const plan = dotnetTestPlan({ status: "complete", ...map }, "C:\\repo");
+        assert.match(plan.reason, /incomplete analysis/);
+        assert.doesNotMatch(plan.reason, /No statically resolved xUnit tests reach/);
+    }
+    const result = pathEvidence({ id: "bounded" }, {
+        status: "added", decision: { line: 1 }, evidence: { level: "none", tests: [], limited: true },
+    });
+    assert.equal(result.level, "none");
+    assert.equal(result.text, "No test evidence in incomplete analysis");
 });
 
 test("NuGet assessment queries only NuGet and NuGet OSV for the exact saved version", async () => {

@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "analyzer"))
-from language_adapters import AnalysisSnapshot
+from language_adapters import AdapterUnavailable, AnalysisSnapshot
 from node_adapter import NODE_ADAPTER, NodeAdapter
-from node_packages import package_diff, parse_packages
+from node_packages import package_diff, parse_locked_packages, parse_packages
 from review_model import ReviewModel
 
 
@@ -94,6 +96,47 @@ class NodePackageTests(unittest.TestCase):
         self.assertEqual(change["kind"], "version_changed")
         self.assertEqual(change["resolved_after"], "1.1.0")
 
+    def test_transitive_lock_only_changes_are_first_class_package_changes(self):
+        def files(axios, source_map):
+            return {
+                "package.json": encode({"dependencies": {"axios": "^1"}}),
+                "package-lock.json": encode({"lockfileVersion": 3, "packages": {
+                    "": {"dependencies": {"axios": "^1"}},
+                    "node_modules/axios": {"version": axios},
+                    "node_modules/source-map-js": {"version": source_map, "dev": True},
+                    "node_modules/postcss": {
+                        "version": "8.5.25",
+                        "dependencies": {"source-map-js": "^1.2.1"},
+                    },
+                }}),
+            }
+        adapter = NodeAdapter()
+        dependencies = adapter.dependencies(snapshot(
+            baseline=files("1.18.1", "1.2.1"),
+            current=files("1.20.0", "1.2.2"),
+        ), [])
+        self.assertEqual({item["name"] for item in dependencies["changes"]}, {"axios", "source-map-js"})
+        transitive = next(item for item in dependencies["current"] if item["name"] == "source-map-js")
+        self.assertEqual(transitive["group"], "transitive")
+        self.assertEqual(transitive["resolved_version"], "1.2.2")
+        self.assertTrue(transitive["transitive"])
+        self.assertEqual(transitive["source"], "package-lock.json")
+        self.assertGreater(transitive["line"], 0)
+        self.assertEqual(transitive["required_by"][0]["name"], "postcss")
+        self.assertEqual(transitive["required_by"][0]["version"], "8.5.25")
+        self.assertGreater(transitive["required_by"][0]["line"], 0)
+
+    def test_ambiguous_transitive_locked_versions_are_not_misreported(self):
+        warnings = []
+        packages = parse_locked_packages({
+            "package-lock.json": encode({"lockfileVersion": 3, "packages": {
+                "node_modules/demo": {"version": "1.0.0"},
+                "node_modules/parent/node_modules/demo": {"version": "2.0.0"},
+            }}),
+        }, warnings)
+        self.assertEqual(packages, [])
+        self.assertTrue(any("multiple locked versions" in warning for warning in warnings))
+
     def test_workspace_and_local_declarations_cannot_be_mistaken_for_registry_packages(self):
         files = {
             "package.json": encode({"workspaces": ["packages/*"], "dependencies": {
@@ -127,6 +170,23 @@ class NodeAdapterTests(unittest.TestCase):
                                               ".node-runner-fixture-123/package.json",
                                               ".coverage-import-fixture-123/source.ts"}))
             process.assert_not_called()
+
+    def test_compiler_invocation_reports_elapsed_heartbeats_while_work_continues(self):
+        adapter = NodeAdapter()
+        adapter.heartbeat_seconds = 0.01
+        updates = []
+
+        def delayed(*_args, **_kwargs):
+            time.sleep(0.035)
+            return subprocess.CompletedProcess([], 0, "{}", "")
+
+        with patch("node_adapter.shutil.which", return_value="node"), patch(
+            "node_adapter.subprocess.run", side_effect=delayed
+        ):
+            self.assertEqual(adapter._invoke("node-compiler.mjs", {}, updates.append), {})
+
+        self.assertGreaterEqual(len(updates), 1)
+        self.assertEqual(updates, sorted(updates))
 
     def test_snapshot_graph_merges_without_rewriting_foreign_facts_and_serializes_model(self):
         current = {
@@ -162,14 +222,24 @@ class NodeAdapterTests(unittest.TestCase):
         adapter.resolve_package_usage(model, dependencies)
         self.assertEqual(dependencies["current"][0]["used_by"], [])
 
-    def test_missing_compiler_reports_unknown_without_losing_other_language_graph(self):
+    def test_missing_compiler_propagates_to_transactional_orchestrator(self):
         adapter = NodeAdapter()
         model = ReviewModel({})
         model.symbols.append({"id": "foreign"})
-        with patch.object(adapter, "_invoke", side_effect=RuntimeError("missing typescript")):
-            adapter.scan(snapshot(current={"app.ts": b"export function run(){}"}), model, {}, lambda *_: None)
+        with patch.object(adapter, "_invoke", side_effect=AdapterUnavailable("missing typescript")):
+            with self.assertRaisesRegex(AdapterUnavailable, "missing typescript"):
+                adapter.scan(snapshot(current={"app.ts": b"export function run(){}"}), model, {}, lambda *_: None)
         self.assertEqual(model.symbols, [{"id": "foreign"}])
-        self.assertTrue(any("missing typescript" in message for message in model.warnings))
+        self.assertEqual(model.warnings, [])
+
+    def test_expected_helper_protocol_failures_are_typed(self):
+        adapter = NodeAdapter()
+        for output in ("not JSON", "[]"):
+            with self.subTest(output=output), patch("node_adapter.shutil.which", return_value="node"), patch(
+                "node_adapter.subprocess.run", return_value=subprocess.CompletedProcess([], 0, output, "")
+            ):
+                with self.assertRaises(AdapterUnavailable):
+                    adapter._invoke("node-compiler.mjs", {})
 
     def test_manifest_only_analysis_never_loads_the_compiler_or_coverage_process(self):
         adapter = NodeAdapter()
@@ -200,16 +270,35 @@ class NodeAdapterTests(unittest.TestCase):
         script, payload = invoke.call_args.args
         self.assertEqual(script, "node-compiler.mjs")
         self.assertIs(payload["use_cache"], False)
+        self.assertIs(payload["include_cache_stats"], True)
 
     def test_coverage_delegate_receives_historical_snapshot_text_and_repository(self):
         adapter = NodeAdapter()
         expected = {"available": False, "files": [], "changed_lines": {}}
+        current = {"a.ts": b"new", "coverage/sources.json": b"{}"}
         with patch.object(adapter, "_invoke", return_value=expected) as invoke:
-            self.assertIs(adapter.coverage(snapshot({"a.ts": b"old"}, {"a.ts": b"new"})), expected)
+            self.assertIs(adapter.coverage(snapshot({"a.ts": b"old"}, current)), expected)
         script, payload = invoke.call_args.args
         self.assertEqual(script, "node-coverage.mjs")
         self.assertEqual(payload, {"repo": ".", "baseline": {"a.ts": "old"},
-                                   "current": {"a.ts": "new"}, "historical": True})
+                                   "current": {path: raw.decode() for path, raw in current.items()}, "historical": True})
+
+    def test_missing_coverage_inputs_do_not_transfer_the_source_snapshot(self):
+        adapter = NodeAdapter()
+        with patch.object(adapter, "_invoke", side_effect=AssertionError("unnecessary snapshot transfer")):
+            self.assertEqual(adapter.coverage(snapshot(current={"a.ts": b"source"})),
+                             {"available": False, "files": [], "changed_lines": {}})
+
+    def test_worktree_coverage_probes_live_reports_but_historical_coverage_never_does(self):
+        adapter = NodeAdapter()
+        saved = snapshot(current={"a.ts": b"source"}, historical=False)
+        expected = {"available": True, "files": [], "changed_lines": {}}
+        with patch("pathlib.Path.is_file", return_value=True), patch.object(adapter, "_invoke", return_value=expected) as invoke:
+            self.assertIs(adapter.coverage(saved), expected)
+            self.assertFalse(invoke.call_args.args[1]["historical"])
+        with patch("pathlib.Path.is_file", side_effect=AssertionError("historical checkout read")), patch.object(adapter, "_invoke") as invoke:
+            self.assertFalse(adapter.coverage(snapshot(current={"a.ts": b"source"}))["available"])
+            invoke.assert_not_called()
 
     def test_real_coverage_cli_accepts_stdin_snapshot_without_live_reports(self):
         report = NODE_ADAPTER.coverage(snapshot(current={"app.ts": b"export function run(){}"}))

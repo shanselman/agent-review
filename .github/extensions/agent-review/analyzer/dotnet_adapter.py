@@ -4,12 +4,16 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from language_adapters import AnalysisSnapshot
+from git_snapshot import text_lines
+from language_adapters import AdapterUnavailable, AnalysisSnapshot
 from review_model import ReviewModel, stable_id
 
 
@@ -28,10 +32,13 @@ def helper_path() -> Path:
     )
 
 
-def run_dotnet_helper(payload: dict[str, Any]) -> dict[str, Any]:
+def run_dotnet_helper(
+    payload: dict[str, Any], *, on_wait: Callable[[float], None] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     helper = helper_path()
     if not helper.is_file():
-        raise RuntimeError(
+        raise AdapterUnavailable(
             f"C# analysis requires the prepared Roslyn helper: {helper}. "
             "Install .NET SDK 10 and build the extension's trusted "
             "dotnet-analyzer\\AgentReview.DotnetAnalyzer.csproj with dotnet build -c Release "
@@ -40,7 +47,7 @@ def run_dotnet_helper(payload: dict[str, Any]) -> dict[str, Any]:
         )
     with tempfile.TemporaryDirectory(prefix="agent-review-dotnet-") as directory:
         request = Path(directory) / "request.json"
-        request.write_text(json.dumps(payload), encoding="utf-8")
+        request.write_text(json.dumps({**payload, **({"progress": True} if on_progress else {})}), encoding="utf-8")
         environment = os.environ.copy()
         if payload.get("use_cache") is False:
             environment["AGENT_REVIEW_DOTNET_CACHE"] = ""
@@ -49,26 +56,107 @@ def run_dotnet_helper(payload: dict[str, Any]) -> dict[str, Any]:
                               or Path.home() / ".copilot" / "agent-review" / "file-cache")
             environment["AGENT_REVIEW_DOTNET_CACHE"] = str(cache_root / "dotnet-facts")
         try:
-            result = subprocess.run(
-                [os.environ.get("AGENT_REVIEW_DOTNET", "dotnet"), str(helper), "--input", str(request)],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
-                env=environment,
-            )
+            command = [os.environ.get("AGENT_REVIEW_DOTNET", "dotnet"), str(helper), "--input", str(request)]
+            if on_progress:
+                with (Path(directory) / "result.json").open("w+", encoding="utf-8") as output:
+                    with subprocess.Popen(command, stdout=output, stderr=subprocess.PIPE, text=True,
+                                          encoding="utf-8", errors="replace", env=environment) as process:
+                        def read_progress() -> str:
+                            tail: deque[str] = deque(maxlen=100)
+                            assert process.stderr is not None
+                            for line in process.stderr:
+                                tail.append(line[-6000:])
+                                if line.startswith("AGENT_REVIEW_DOTNET_PROGRESS "):
+                                    try:
+                                        event = json.loads(line.removeprefix("AGENT_REVIEW_DOTNET_PROGRESS "))
+                                    except json.JSONDecodeError as error:
+                                        raise RuntimeError("Roslyn helper returned invalid project progress JSON.") from error
+                                    if not isinstance(event, dict) or not isinstance(event.get("message"), str):
+                                        raise RuntimeError("Roslyn helper returned an invalid project progress event.")
+                                    on_progress(event["message"])
+                            return "".join(tail)[-6000:]
+
+                        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="agent-review-dotnet-progress") as executor:
+                            stderr = executor.submit(read_progress)
+                            started = time.monotonic()
+                            try:
+                                while True:
+                                    if stderr.done():
+                                        stderr.result()
+                                    remaining = 120 - (time.monotonic() - started)
+                                    if remaining <= 0:
+                                        raise subprocess.TimeoutExpired(command, 120)
+                                    try:
+                                        process.wait(timeout=min(5, remaining))
+                                        break
+                                    except subprocess.TimeoutExpired:
+                                        if on_wait:
+                                            on_wait(time.monotonic() - started)
+                            finally:
+                                if process.poll() is None:
+                                    process.kill()
+                                    process.wait()
+                            output.seek(0)
+                            result = subprocess.CompletedProcess(command, process.returncode,
+                                                                 output.read(), stderr.result())
+            else:
+                result = _run_helper_command(command, environment, on_wait)
         except FileNotFoundError as error:
-            raise RuntimeError("C# analysis requires dotnet on PATH or AGENT_REVIEW_DOTNET; "
+            raise AdapterUnavailable("C# analysis requires dotnet on PATH or AGENT_REVIEW_DOTNET; "
                                "install a local .NET 10 runtime/SDK. No reviewed code was executed.") from error
         except subprocess.TimeoutExpired as error:
-            raise RuntimeError("Roslyn snapshot analysis exceeded 120 seconds; reduce snapshot scope.") from error
+            raise AdapterUnavailable("Roslyn snapshot analysis exceeded 120 seconds; reduce snapshot scope.") from error
         if result.returncode:
-            raise RuntimeError(f"Roslyn snapshot analysis failed (exit {result.returncode}): "
+            raise AdapterUnavailable(f"Roslyn snapshot analysis failed (exit {result.returncode}): "
                                f"{result.stderr[-6000:]}")
         try:
             value = json.loads(result.stdout)
         except json.JSONDecodeError as error:
-            raise RuntimeError(f"Roslyn helper returned invalid JSON: {result.stderr[-2000:]}") from error
+            raise AdapterUnavailable(f"Roslyn helper returned invalid JSON: {result.stderr[-2000:]}") from error
         if not isinstance(value, dict):
-            raise RuntimeError("Roslyn helper output must be a JSON object.")
+            raise AdapterUnavailable("Roslyn helper output must be a JSON object.")
         return value
+
+
+def _run_helper_command(command: list[str], environment: dict[str, str],
+                        on_wait: Callable[[float], None] | None) -> subprocess.CompletedProcess[str]:
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="agent-review-dotnet") as executor:
+        started = time.monotonic()
+        pending = executor.submit(
+            subprocess.run, command,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+            env=environment,
+        )
+        while True:
+            try:
+                return pending.result(timeout=5)
+            except FutureTimeout:
+                if on_wait:
+                    on_wait(time.monotonic() - started)
+
+
+def normalize_code_paths(facts: dict) -> dict:
+    result = facts["code_paths"]
+    verification = result.get("verification")
+    if verification is not None and "omitted_test_candidates" not in verification and "omitted_tests" in verification:
+        verification["omitted_test_candidates"] = verification["omitted_tests"]
+        verification["omitted_tests"] = 0
+    names = {symbol["id"]: symbol["qualname"] for symbol in facts.get("symbols", [])}
+    for callable in result.get("callables", []):
+        scope = callable["id"].split("::", 1)[0]
+        callable["language"] = "csharp"
+        callable["ecosystem"] = "nuget"
+        callable["compiler_scope"] = scope
+        callable["target_framework"] = scope.rsplit("@", 1)[-1] if "@" in scope else None
+    for test in result.get("verification", {}).get("tests", []):
+        targets = test.get("callables", test["calls"])
+        test["callable_ids"] = list(targets)
+        test["callables"] = sorted({names.get(identifier, identifier) for identifier in targets})
+        if test["link"] == "reachable":
+            test["link"] = "via"
+            test.setdefault("via", "a resolved production caller")
+    result.setdefault("warnings", []).extend(facts.get("warnings", []))
+    return result
 
 
 class DotnetAdapter:
@@ -90,11 +178,11 @@ class DotnetAdapter:
                 try:
                     root = ET.fromstring(data)
                 except ET.ParseError as error:
-                    raise ValueError(f"Cannot compare NuGet declarations: {side} manifest {path} "
+                    raise AdapterUnavailable(f"Cannot compare NuGet declarations: {side} manifest {path} "
                                      f"contains invalid XML ({error}). Use a valid manifest/comparison "
                                      "before assessing dependency changes.") from error
                 if root.tag.rsplit("}", 1)[-1] != "Project":
-                    raise ValueError(f"Cannot compare NuGet declarations: {side} manifest {path} "
+                    raise AdapterUnavailable(f"Cannot compare NuGet declarations: {side} manifest {path} "
                                      "must have a Project XML root.")
         baseline = parse_dotnet_packages(snapshot.baseline, warnings)
         current = parse_dotnet_packages(snapshot.current, warnings)
@@ -112,9 +200,21 @@ class DotnetAdapter:
             saved = model.source_files.setdefault(path, {})
             saved["baseline"] = trees["baseline"].get(path)
             saved["current"] = trees["current"].get(path)
-        facts = run_dotnet_helper({**trees, "mode": "graph", "use_cache": snapshot.use_cache})
+        stage = "Roslyn is resolving saved C# relationships and code paths"
+
+        def project_progress(message: str) -> None:
+            nonlocal stage
+            stage = message
+            progress(message, 65)
+
+        facts = run_dotnet_helper({**trees, "mode": "decisions", "use_cache": snapshot.use_cache},
+            on_progress=project_progress,
+            on_wait=lambda elapsed: progress(
+                f"{stage} · {round(elapsed):,}s elapsed", 65))
+        if "code_paths" in facts:
+            model.code_paths["csharp"] = normalize_code_paths(facts)
         model.warnings.extend(facts.get("warnings", []))
-        model.repository["csharp_loc"] = sum(len(data.splitlines()) for path, data in trees["current"].items()
+        model.repository["csharp_loc"] = sum(len(text_lines(data)) for path, data in trees["current"].items()
                                              if path.lower().endswith(".cs"))
         model.repository["review_languages"] = sorted({"csharp", *(
             ["python"] if any(path.endswith(".py") for path in set(snapshot.baseline) | set(snapshot.current)) else []

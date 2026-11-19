@@ -1,28 +1,45 @@
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFile, readdir, realpath } from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { listReviewTargets } from "./review-target.mjs";
+import { reviewSnapshotKey } from "./web/review-ledger.mjs";
 
-const webRoot = join(dirname(fileURLToPath(import.meta.url)), "web");
-const staticFiles = new Map([
-    ["/", "index.html"],
-    ["/index.html", "index.html"],
-    ["/app.js", "app.js"],
-    ["/graph.js", "graph.js"],
-    ["/findings.mjs", "findings.mjs"],
-    ["/symbol-links.mjs", "symbol-links.mjs"],
-    ["/package-presentation.mjs", "package-presentation.mjs"],
-    ["/source-references.mjs", "source-references.mjs"],
-    ["/diff-context.mjs", "diff-context.mjs"],
-    ["/decision-map.mjs", "decision-map.mjs"],
-    ["/review-plan.mjs", "review-plan.mjs"],
-    ["/review-ledger.mjs", "review-ledger.mjs"],
-    ["/languages.mjs", "languages.mjs"],
-    ["/connection-feedback.mjs", "connection-feedback.mjs"],
-    ["/analysis-limitations.mjs", "analysis-limitations.mjs"],
-    ["/styles.css", "styles.css"],
-]);
+const browserModels = new WeakMap();
+
+export function browserSnapshot(snapshot) {
+    if (!snapshot.model) return snapshot;
+    const model = snapshot.model;
+    const target = JSON.stringify(snapshot.review_target);
+    let cached = browserModels.get(model);
+    if (!cached || cached.target !== target) {
+        const { code_paths, ...browserModel } = model;
+        const sources = Object.fromEntries(Object.entries(model.source_files || {}).map(([path, source]) =>
+            [path, { binary: Boolean(source.binary) }]));
+        cached = { target, value: { ...browserModel, source_files: sources,
+            review_snapshot_key: reviewSnapshotKey(model, snapshot.review_target) } };
+        browserModels.set(model, cached);
+    }
+    return { ...snapshot, model: cached.value };
+}
+
+const extensionRoot = dirname(fileURLToPath(import.meta.url));
+const webRoot = join(extensionRoot, "web");
+const webFilePattern = /^[A-Za-z0-9][A-Za-z0-9._-]*\.(?:html|js|mjs|css)$/;
+
+async function sourceBuild() {
+    const runtimeFiles = (await readdir(extensionRoot)).filter((name) => name.endsWith(".mjs")).sort();
+    const webFiles = (await readdir(webRoot, { withFileTypes: true }))
+        .filter((entry) => entry.isFile() && webFilePattern.test(entry.name)).map((entry) => entry.name).sort();
+    const files = [...runtimeFiles.map((name) => [name, join(extensionRoot, name)]),
+        ...webFiles.map((name) => [`web/${name}`, join(webRoot, name)])];
+    const hash = createHash("sha256");
+    for (const [name, path] of files) hash.update(name).update("\0").update(await readFile(path)).update("\0");
+    return hash.digest("hex");
+}
+
+// Capture the loaded provider's source, not the source at the next canvas open.
+const providerBuild = await sourceBuild();
 const contentTypes = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -55,7 +72,18 @@ export function startReviewServer(state, options = {}) {
     const clients = new Set();
     const unsubscribe = state.subscribe((event) => {
         if (!clients.size) return;
-        let update = event;
+        let update = browserSnapshot(event);
+        if (["selection", "annotation"].includes(event.type)) {
+            update = { type: event.type, partial: true, review_generation: event.review_generation,
+                ...(event.type === "selection" ? { selection: event.selection } : { annotations: event.annotations }) };
+        }
+        if (event.type === "discussion") update = {
+            type: event.type, partial: true, review_generation: event.review_generation, discussion_update: event.discussion_update,
+        };
+        if (["rule-check-progress", "custom-analysis-progress"].includes(event.type)) {
+            update = { type: event.type, partial: true,
+                ...(event.type === "rule-check-progress" ? { rule_check: event.rule_check } : { custom_analyses: event.custom_analyses }) };
+        }
         if (["progress", "refresh-started", "worktree-changed"].includes(event.type)) {
             update = Object.fromEntries(["type", "loading", "cancelled", "disposed", "error", "progress",
                 "review_target", "review_generation", "repo_root", "analyzed_at", "restored_from_cache",
@@ -78,25 +106,94 @@ export function startReviewServer(state, options = {}) {
                     return;
                 }
             }
-            if (req.method === "GET" && staticFiles.has(pathname)) {
-                const filename = staticFiles.get(pathname);
-                const body = await readFile(join(webRoot, filename));
+            const filename = pathname === "/" ? "index.html" : pathname.slice(1);
+            if (req.method === "GET" && webFilePattern.test(filename)) {
+                let path;
+                try { path = await realpath(join(webRoot, filename)); }
+                catch (error) {
+                    if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+                    sendJson(res, { error: "not_found" }, 404);
+                    return;
+                }
+                if (dirname(path) !== await realpath(webRoot)) {
+                    sendJson(res, { error: "not_found" }, 404);
+                    return;
+                }
+                const body = await readFile(path);
                 res.writeHead(200, {
                     "Content-Type": contentTypes[extname(filename)],
                     "Cache-Control": "no-store",
-                    "Content-Security-Policy": "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self' 'sha256-HNjOU2rt1GsFc5zDEQXklLEbjDyKexAo5wKONo5tkTc='; img-src 'self' data:",
+                    // The Copilot app injects its ambient theme as inline <style> elements, so styles (not scripts) allow inline.
+                    "Content-Security-Policy": "default-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:",
                     "X-Content-Type-Options": "nosniff",
                 });
                 res.end(body);
                 return;
             }
+            if (req.method === "GET" && pathname === "/api/build") {
+                const source = await sourceBuild();
+                sendJson(res, { provider: providerBuild, source, compatible: providerBuild === source });
+                return;
+            }
             if (req.method === "GET" && pathname === "/api/state") {
-                if (!state.model && !state.loading && !state.cancelled && !state.disposed) {
-                    state.refresh().catch((error) => {
-                        if (error.name !== "AbortError") console.error("[agent-review refresh]", error);
-                    });
+                sendJson(res, browserSnapshot(state.snapshot()));
+                return;
+            }
+            if (req.method === "POST" && pathname === "/api/ai-settings") {
+                sendJson(res, { ok: true, ai_settings: state.updateAiSettings(await readJson(req)) });
+                return;
+            }
+            if (req.method === "GET" && pathname === "/api/ai-models") {
+                sendJson(res, { models: await state.listModels() });
+                return;
+            }
+            if (req.method === "GET" && pathname === "/api/review-progress") {
+                sendJson(res, await state.progressForReview());
+                return;
+            }
+            if (req.method === "POST" && pathname === "/api/review-handoff/preview") {
+                sendJson(res, await state.prepareHandoff());
+                return;
+            }
+            if (req.method === "POST" && pathname === "/api/review-handoff/import") {
+                sendJson(res, await state.importHandoff(await readJson(req)));
+                return;
+            }
+            if (req.method === "POST" && pathname === "/api/review-handoff/submit") {
+                sendJson(res, await state.submitHandoff(await readJson(req)));
+                return;
+            }
+            if (req.method === "GET" && pathname === "/api/pr-review") {
+                sendJson(res, await state.prReview());
+                return;
+            }
+            if (req.method === "POST" && pathname === "/api/pr-review/drafts") {
+                try { sendJson(res, await state.updateReviewDraft(await readJson(req))); }
+                catch (error) {
+                    if (error.code !== "review_draft_conflict") throw error;
+                    sendJson(res, { error: error.message, code: error.code }, 409);
                 }
-                sendJson(res, state.snapshot());
+                return;
+            }
+            if (req.method === "POST" && pathname === "/api/review-progress") {
+                try { sendJson(res, await state.saveReviewProgress(await readJson(req))); }
+                catch (error) {
+                    if (error.code !== "review_progress_conflict") throw error;
+                    sendJson(res, { error: error.message, code: error.code }, 409);
+                }
+                return;
+            }
+            if (req.method === "GET" && pathname === "/api/discussion") {
+                sendJson(res, { thread: await state.discussionFor(requestUrl.searchParams.get("id")),
+                    available: Boolean(state.generateDiscussion) });
+                return;
+            }
+            if (req.method === "GET" && pathname === "/api/review-sections") {
+                sendJson(res, state.reviewSectionsFor());
+                return;
+            }
+            if (req.method === "POST" && pathname === "/api/discussion") {
+                sendJson(res, { thread: await state.askDiscussion(await readJson(req)) }, 202);
                 return;
             }
             if (req.method === "GET" && pathname === "/api/source") {
@@ -120,22 +217,34 @@ export function startReviewServer(state, options = {}) {
                 const input = await readJson(req);
                 const snapshot = options.changeRepository
                     ? await options.changeRepository(input) : await state.setRepository(input);
-                state.refresh().catch((error) => {
-                    if (error.name !== "AbortError") console.error("[agent-review repository analysis]", error);
-                });
-                sendJson(res, { ok: true, ...snapshot }, 202);
+                sendJson(res, { ok: true, ...browserSnapshot(snapshot) });
                 return;
             }
             if (req.method === "POST" && pathname === "/api/rule-check") {
-                sendJson(res, { check: await state.runRuleCheck({ force: true }) });
+                const input = await readJson(req);
+                if (input.force !== undefined && typeof input.force !== "boolean") throw new Error("force must be a boolean.");
+                sendJson(res, { check: await state.runRuleCheck({ force: input.force ?? true }) });
+                return;
+            }
+            if (req.method === "POST" && pathname === "/api/internal-reviews/cancel") {
+                const input = await readJson(req);
+                if (typeof input.scope !== "string" || !input.scope) throw new Error("A review scope is required.");
+                state.stopInternalReviews(input.scope);
+                sendJson(res, { ok: true });
                 return;
             }
             if (req.method === "GET" && pathname === "/api/test-run/plan") {
                 sendJson(res, await state.testRunPlan());
                 return;
             }
+            if (req.method === "POST" && pathname === "/api/test-run/plan") {
+                const input = await readJson(req);
+                sendJson(res, await state.testRunPlan({ layer: input?.layer || null }));
+                return;
+            }
             if (req.method === "POST" && pathname === "/api/test-run") {
-                sendJson(res, { run: await state.runLinkedTests() }, 202);
+                const input = await readJson(req);
+                sendJson(res, { run: await state.runLinkedTests({ layer: input?.layer || null }) }, 202);
                 return;
             }
             if (req.method === "POST" && pathname === "/api/test-run/cancel") {
@@ -143,9 +252,18 @@ export function startReviewServer(state, options = {}) {
                 return;
             }
             if (req.method === "GET" && pathname === "/api/review-targets") {
-                sendJson(res, await listReviewTargets(state.repoRoot, {
+                sendJson(res, await state.listReviewTargets({
                     mode: requestUrl.searchParams.get("mode"),
                     page: Number(requestUrl.searchParams.get("page") || 0),
+                }));
+                return;
+            }
+            if (req.method === "POST" && pathname === "/api/review-targets/refresh") {
+                const input = await readJson(req);
+                sendJson(res, await state.listReviewTargets({
+                    mode: input.mode,
+                    page: 0,
+                    refresh: input.mode === "commit",
                 }));
                 return;
             }
@@ -183,12 +301,7 @@ export function startReviewServer(state, options = {}) {
                     Connection: "keep-alive",
                 });
                 res.write(": connected\n\n");
-                if (!state.model && !state.loading && !state.cancelled && !state.disposed) {
-                    state.refresh().catch((error) => {
-                        if (error.name !== "AbortError") console.error("[agent-review refresh]", error);
-                    });
-                }
-                res.write(`event: state\ndata: ${JSON.stringify({ type: "connected", ...state.snapshot() })}\n\n`);
+                res.write(`event: state\ndata: ${JSON.stringify({ type: "connected", ...browserSnapshot(state.snapshot()) })}\n\n`);
                 clients.add(res);
                 const ping = setInterval(() => res.write(": ping\n\n"), 25_000);
                 req.on("close", () => {
@@ -198,7 +311,7 @@ export function startReviewServer(state, options = {}) {
                 return;
             }
             if (req.method === "POST" && pathname === "/api/cancel") {
-                sendJson(res, { ok: true, ...await state.cancel() });
+                sendJson(res, { ok: true, ...browserSnapshot(await state.cancel()) });
                 return;
             }
             if (req.method === "POST" && pathname === "/api/refresh") {
@@ -226,8 +339,20 @@ export function startReviewServer(state, options = {}) {
                 });
                 return;
             }
+            if (req.method === "GET" && pathname === "/api/document-roles") {
+                sendJson(res, { ok: true, roles: await state.rolesForReview() });
+                return;
+            }
+            if (req.method === "POST" && pathname === "/api/document-roles") {
+                sendJson(res, { ok: true, roles: await state.correctDocumentRole(await readJson(req)) });
+                return;
+            }
             if (req.method === "POST" && pathname === "/api/overview") {
                 sendJson(res, { ok: true, annotation: await state.overviewFor() });
+                return;
+            }
+            if (req.method === "POST" && pathname === "/api/layer-summaries") {
+                sendJson(res, { ok: true, annotation: await state.layerSummariesFor() });
                 return;
             }
             if (req.method === "POST" && pathname === "/api/package-risk") {

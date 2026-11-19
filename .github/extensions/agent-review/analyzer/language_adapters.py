@@ -8,6 +8,10 @@ from typing import Any, Protocol
 from review_model import ReviewModel
 
 
+class AdapterUnavailable(RuntimeError):
+    """Expected tooling or saved-input failure; not a scanner programming error."""
+
+
 @dataclass(frozen=True)
 class AnalysisSnapshot:
     repo: Path
@@ -69,6 +73,14 @@ def active_adapters(
             from rust_adapter import RUST_ADAPTER
 
             adapters = (*adapters, RUST_ADAPTER)
+        if any(path.lower().endswith(".md") for path in paths):
+            from markdown_adapter import MARKDOWN_ADAPTER
+
+            adapters = (*adapters, MARKDOWN_ADAPTER)
+        from cpp_adapter import CPP_ADAPTER
+
+        if CPP_ADAPTER.applies(paths):
+            adapters = (*adapters, CPP_ADAPTER)
     ids = [adapter.id for adapter in adapters]
     if len(ids) != len(set(ids)):
         raise ValueError("Language adapters must have unique IDs.")

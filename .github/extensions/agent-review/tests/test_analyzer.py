@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gzip
+import io
 import json
 import subprocess
 import sys
@@ -13,6 +15,7 @@ from pathlib import Path
 ANALYZER = Path(__file__).parents[1] / "analyzer" / "analyze.py"
 sys.path.insert(0, str(ANALYZER.parent))
 from packages import parse_packages, resolve_declared_versions
+from analyze import write_review_json
 
 
 def declaration_slice(text: str, declaration: dict) -> str:
@@ -25,6 +28,20 @@ def declaration_slice(text: str, declaration: dict) -> str:
 
 
 class PackageVersionTests(unittest.TestCase):
+    def test_buffered_review_json_is_byte_identical_to_sorted_json(self) -> None:
+        value = {"source_files": {"large.py": {"current": "saved \u00e9\n" * 10000, "baseline": None}},
+                 "changes": [{"path": "large.py", "added_lines": [1, 2], "ratio": 0.5}],
+                 "warnings": [], "metadata": {"empty": {}, "flag": True}, "scalar": None}
+        class RecordingStream(io.StringIO):
+            writes = 0
+            def write(self, text: str) -> int:
+                self.writes += 1
+                return super().write(text)
+        output = RecordingStream()
+        write_review_json(value, output)
+        self.assertEqual(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", output.getvalue())
+        self.assertLess(output.writes, 60, "write complete records, not every JSON token")
+
     def test_project_pin_does_not_use_the_analyzer_environment(self) -> None:
         records = parse_packages({"requirements.txt": b"demo==1.0\n"})
         records[0]["resolved_version"] = "9.9"
@@ -200,6 +217,49 @@ class AnalyzerTests(unittest.TestCase):
             text=True,
         )
         return json.loads(process.stdout)
+
+    def test_gzip_transport_matches_default_json_and_reports_serialization(self) -> None:
+        self.write("source.py", "def run():\n    return 'saved source'\n")
+        base = self.commit()
+        self.write("source.py", "def run():\n    return 'changed saved source'\n")
+        expected = self.analyze(base)
+        process = subprocess.run([
+            sys.executable, str(ANALYZER), "--repo", str(self.repo), "--base-ref", base, "--gzip",
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(expected, json.loads(gzip.decompress(process.stdout)))
+        events = [json.loads(line.removeprefix("AGENT_REVIEW_PROGRESS "))
+                  for line in process.stderr.decode().splitlines() if line.startswith("AGENT_REVIEW_PROGRESS ")]
+        self.assertEqual("serialization", events[-2]["phase"])
+        self.assertEqual(98, events[-2]["percent"])
+        self.assertEqual("complete", events[-1]["phase"])
+        self.assertEqual(100, events[-1]["percent"])
+
+    def test_documentation_only_change_does_not_report_existing_complex_go_callables(self) -> None:
+        body = " if x > 0 { x-- }\n" * 7 + " return x\n"
+        self.write("value.go", "package demo\ntype Value struct{}\nfunc Evaluate(x int) int {\n"
+                   + body + "}\nfunc (v Value) Run(x int) int {\n" + body + "}\n")
+        self.write("README.md", "Before\n")
+        base = self.commit()
+        self.write("README.md", "After\n")
+        head = self.commit()
+        payload = self.analyze(base)
+        self.assertEqual(base, payload["metadata"]["base_sha"])
+        self.assertEqual(head, payload["metadata"]["head_sha"])
+        self.assertEqual(1, payload["summary"]["files_changed"])
+        self.assertEqual(1, payload["summary"]["lines_added"])
+        self.assertEqual(1, payload["summary"]["lines_removed"])
+        self.assertEqual(["README.md"], [item["path"] for item in payload["changes"]
+                                        if item["status"] != "unchanged"])
+        self.assertEqual(0, payload["summary"]["symbols_changed"])
+        callables = [node for node in payload["nodes"] if node["type"] in ("function", "method")]
+        self.assertEqual(2, len(callables))
+        for node in callables:
+            self.assertEqual("unchanged", node["change"])
+            self.assertEqual(0, node["metrics"]["lines_changed"])
+            self.assertEqual(8, node["metrics"]["complexity_base"])
+            self.assertEqual(8, node["metrics"]["complexity_current"])
+            self.assertEqual(node["signatures"]["base"], node["signatures"]["current"])
+        self.assertEqual([], payload["attention"])
 
     def test_symbols_calls_inheritance_complexity_and_aggregate_edges(self) -> None:
         self.write("lib/util.py", "def helper(value):\n    return value\n\nclass Base:\n    pass\n")

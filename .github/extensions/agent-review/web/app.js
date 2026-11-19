@@ -1,21 +1,97 @@
-import { renderGraph } from "/graph.js";
-import { findingsForNode, findingKey, isFindingClosed, orderFindings } from "/findings.mjs";
-import { resolveSymbolReference } from "/symbol-links.mjs";
-import { packageEvidenceLinks } from "/package-presentation.mjs";
-import { resolveSourceReference } from "/source-references.mjs";
-import { unchangedDiffContext, diffSegments } from "/diff-context.mjs";
-import { isReviewSymbol, isTestPath, languageForPath } from "/languages.mjs";
-import { ConnectionFeedback } from "/connection-feedback.mjs";
-import { describeAnalysisWarning } from "/analysis-limitations.mjs";
-import { buildReviewPlan } from "/review-plan.mjs";
-import {
-    REVIEW_DISPOSITIONS, isReviewComplete, nextReviewItem, parseReviewLedger, reviewProgress,
+let startupFailed = false;
+const startupTimer = setTimeout(() => showStartupFailure(new Error("Startup exceeded 10 seconds. A browser module or the provider did not respond.")), 10_000);
+
+function showStartupFailure(error) {
+    startupFailed = true;
+    clearTimeout(startupTimer);
+    const panel = document.getElementById("error");
+    const updated = error.code === "provider_updated";
+    const title = document.createElement("strong");
+    title.textContent = updated ? "Agent Review was updated - reload extensions" : "Agent Review could not start";
+    const guidance = document.createElement("p");
+    guidance.textContent = "Reload extensions in your Copilot host, then reopen this canvas in the same session. If your host has no reload-extensions action, update or reimport Agent Review using its original installation method, or restart Copilot. Reanalyze and Retry page do not restart an old provider. Do not kill the provider or delete your session or worktree.";
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.textContent = "Retry page";
+    retry.addEventListener("click", () => location.reload());
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = "Technical details";
+    const technical = document.createElement("pre");
+    technical.textContent = error.message;
+    details.append(summary, technical);
+    panel.replaceChildren(title, guidance, retry, details);
+    panel.classList.add("startup-error");
+    panel.classList.remove("hidden");
+    const status = document.getElementById("status");
+    status.textContent = updated ? "Update requires reload" : "Startup failed";
+    status.classList.add("startup-failed");
+    document.getElementById("analysis-progress").classList.add("hidden");
+    for (const control of document.querySelectorAll(".top-actions button, .top-actions select")) control.disabled = true;
+    for (const element of document.querySelectorAll(".workspace, #review-overview, #review-background")) element.classList.add("hidden");
+}
+
+async function checkProviderBuild() {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        let response;
+        try { response = await fetch("/api/build", { signal: AbortSignal.timeout(2000) }); }
+        catch (error) {
+            if (attempt === 2) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 250));
+            continue;
+        }
+        // Legacy providers do not advertise a build; import failures below still get recovery guidance.
+        if (response.status === 404) return;
+        if (!response.ok) throw new Error(`Unable to check the provider build (HTTP ${response.status}).`);
+        const build = await response.json();
+        if (build.compatible !== true) {
+            const error = new Error(`Loaded provider: ${build.provider}\nUpdated source: ${build.source}`);
+            error.code = "provider_updated";
+            throw error;
+        }
+        return;
+    }
+}
+
+async function startApp() {
+await checkProviderBuild();
+const [
+    { renderGraph, resizeGraph },
+    { findingsForNode, findingKey, groupFindings, isFindingClosed, orderFindings },
+    { resolveSymbolReference },
+    { packageEvidenceLinks },
+    { resolveSourceReference, sourceReferencesInText },
+    { unchangedDiffContext, diffSegments },
+    { impactSlice },
+    { ItemDiscussionPane },
+    { aiPlaceholder: activityPlaceholder },
+    { parseReviewLocation, reviewLocation },
+    { annotationSections, conciseReviewText, internalReviewPresentation, overviewBlurb, reviewCommands, reviewContext, reviewItemEvidence, reviewSignal },
+    { isReviewSymbol, isTestPath, languageForPath },
+    { ConnectionFeedback },
+    { AnalyzerErrorPresenter },
+    { describeAnalysisWarning, summarizeAnalysisWarnings, unlinkedSentence },
+    { buildReviewPlan, concernPriorities },
+    { fileTree, groupForSource, reviewSequence, treeTotals, workspaceNavigation },
+    { countLabel, plural },
+    {
+    REVIEW_DISPOSITIONS, concernTriage, effectiveDisposition, fileReviewId, fileReviewProgress, isConcernSetAside, isReviewComplete, nextFileReview, parseReviewLedger, reviewProgress,
     reviewSnapshotKey, serializeReviewLedger,
-} from "/review-ledger.mjs";
-import {
+    },
+    {
     callableName, callablesForSubject, changedCallables, decisionAction, decisionConditions, decisionSentence, decisionTotals,
-    EVIDENCE_GROUPS, evidenceCounts, linkedTestOutcome, pathEvidence,
-} from "/decision-map.mjs";
+    EVIDENCE_GROUPS, baseTestId, evidenceCounts, layerTestStatus, linkedTestOutcome, pathEvidence, scopeDecisionMap,
+    },
+] = await Promise.all([
+    import("/graph.js"), import("/findings.mjs"), import("/symbol-links.mjs"),
+    import("/package-presentation.mjs"), import("/source-references.mjs"), import("/diff-context.mjs"),
+    import("/impact-model.mjs"), import("/item-discussion-ui.mjs"), import("/ai-activity.mjs"),
+    import("/review-location.mjs"), import("/review-presentation.mjs"), import("/languages.mjs"),
+    import("/connection-feedback.mjs"), import("/analyzer-error.mjs"), import("/analysis-limitations.mjs"), import("/review-plan.mjs"),
+    import("/review-workspace.mjs"), import("/count-format.mjs"), import("/review-ledger.mjs"),
+    import("/decision-map.mjs"),
+]);
+if (startupFailed) return;
 
 const state = {
     payload: null,
@@ -39,15 +115,43 @@ const state = {
     detailVisible: false,
     sourceHistory: { entries: [], index: -1, pending: -1 },
     appliedServerSelection: null,
+    impact: null,
     closedFindingKeys: new Set(),
     reviewLedger: new Map(),
     customOpenKeys: new Set(),
+    reviewPage: "overview",
+    navigationMode: "groups",
+    navigationQuery: "",
+    readingPane: "code",
+    exploring: false,
+    fileReviewDrafts: new Map(),
+    annotationRequests: new Map(),
+    annotationDisclosures: new Map(),
+    annotationView: null,
+    annotationGeneration: null,
+    viewHistory: [],
+    sourceReturnView: null,
 };
 const elements = Object.fromEntries([
-    "review-target-form", "review-mode", "review-ref", "review-target-label", "repository-identity", "review-more", "review-options-status", "review-picker-notice", "clean-review", "change-brief",
-    "status", "refresh", "cancel-analysis", "analysis-cancelled", "source-context-notice", "connection-notice", "reconnect", "worktree-notice", "worktree-notice-text", "worktree-reanalyze", "error", "analysis-progress", "progress-phase", "progress-message", "progress-percent",
-    "progress-bar", "summary", "breadcrumbs", "attention", "attention-count", "packages", "rail-resize",
-    "graph", "level-label", "graph-title", "zoom-out", "changed-only", "review-search", "detail-toggle", "detail", "detail-close", "source-panel", "source-title",
+    "source-coverage", "source-position", "diff-layout", "source-strip", "source-strip-toggle", "source-strip-body", "overview-layers", "overview-stats", "overview-limitation",
+    "review-target-form", "review-mode", "review-ref", "review-target-label", "repository-identity", "review-list-refresh", "review-more", "review-options-status", "review-picker-notice", "clean-review", "change-brief",
+    "review-overview", "review-background", "overview-title", "overview-description", "overview-progress", "overview-scope", "overview-start", "overview-files",
+    "review-workflow", "workflow-overview", "workflow-review", "workflow-finish", "review-finish", "workspace-target", "workspace-freshness", "workspace-find", "workspace-nav-toggle", "ai-settings", "ai-model", "ai-language", "ai-settings-note",
+    "workspace-return-source", "review-navigation", "workspace-groups", "workspace-files", "workspace-search", "workspace-count",
+    "workspace-nav-list", "workspace-code", "workspace-context", "workspace-group-label", "workspace-group-retry", "workspace-prefetch", "overview-prefetch",
+    "workspace-discuss", "workspace-comment", "source-review-context", "source-origin",
+    "explore-priorities", "explore-concerns", "explore-groups", "explore-architecture", "explore-paths", "explore-packages",
+    "review-progress-status", "review-progress-retry", "review-progress-backup", "file-review-form", "file-review-label",
+    "file-review-disposition", "file-review-note", "file-review-save", "file-review-open-next", "file-review-next", "file-review-status", "file-review-retry",
+    "group-review-dialog", "group-review-title", "group-review-scope", "group-review-error", "group-review-confirm", "group-review-cancel", "group-review-close",
+    "review-handoff", "handoff-close", "handoff-status", "handoff-error", "handoff-refresh", "handoff-markdown",
+    "handoff-markdown-save", "handoff-state-save", "handoff-state-preview", "handoff-import-file", "handoff-import-preview",
+    "handoff-import-confirm", "handoff-import-error", "handoff-provider", "handoff-provider-section", "handoff-verdict", "handoff-confirm-text", "handoff-provider-status", "handoff-provider-error", "handoff-confirm", "handoff-submit", "handoff-summary",
+    "status", "refresh", "cancel-analysis", "analysis-cancelled", "source-context-notice", "connection-notice", "reconnect", "worktree-notice", "worktree-notice-text", "worktree-overview", "error", "analysis-progress", "progress-phase", "progress-message", "progress-percent",
+    "progress-bar", "summary", "breadcrumbs", "attention", "attention-count", "packages", "rail-resize", "workspace-nav-resize", "source-side-resize", "impact-view", "source-impact",
+    "show-evidence", "show-discussion", "item-discussion", "sections-view", "source-section",
+    "source-focus", "source-location", "review-command-open", "review-command-palette", "review-command-close", "review-command-query", "review-command-count", "review-command-results",
+    "graph", "graph-close", "level-label", "graph-title", "zoom-out", "changed-only", "review-search", "detail-toggle", "detail", "detail-back", "detail-close", "source-panel", "source-title",
     "source-provenance", "source-decisions", "source-annotation", "source-risk", "source-close", "source", "source-ruler", "source-back", "source-forward",
     "session-history-panel", "session-history-title", "session-history-meta", "session-history-close", "session-transcript",
     "custom-analyses", "custom-results", "custom-manage", "prompt-manager", "prompt-manager-close",
@@ -56,12 +160,951 @@ const elements = Object.fromEntries([
     "prompt-manager-error", "prompt-library", "prompt-editor", "prompt-editor-title", "prompt-scope",
     "prompt-title", "prompt-text", "prompt-enabled", "prompt-save", "prompt-new",
 ].map((id) => [id.replaceAll("-", "_"), document.getElementById(id)]));
+const analyzerErrorPresenter = new AnalyzerErrorPresenter(elements.error, {
+    retry: async () => {
+        if (state.analyzerRetryPending || state.payload?.loading || state.connectionLost) return;
+        state.analyzerRetryPending = true;
+        elements.status.focus({ preventScroll: true });
+        renderError();
+        try {
+            if (state.reviewPickerPending) await openSelectedReview();
+            else await reanalyze();
+        } finally {
+            state.analyzerRetryPending = false;
+            renderError();
+        }
+    },
+    copy: (button, text, onError) => copyText(button, text, onError),
+});
 const connectionFeedback = new ConnectionFeedback({
     onChange: (phase) => {
         state.connectionLost = phase !== "connected";
         renderConnectionNotice();
+        renderReviewOverview();
+        renderWorkspaceShell();
     },
 });
+const discussionPane = new ItemDiscussionPane(elements.item_discussion, {
+    api, notify: showError, latest: () => state.payload?.discussion_update,
+    renderContent: (container, text) => renderMarkdown(container, text, { sourceReferences: false }),
+    viewedLocation: viewedSourceLocation,
+    sourceLink: (citation) => sourceReferenceButton(
+        `${citation.path}:${citation.line}${citation.side === "base" ? " (base)" : ""}`,
+        { path: citation.path, lines: [citation.line], side: citation.side }),
+});
+
+function renderWorkspaceShell() {
+    const ready = Boolean(state.payload?.model && !state.reviewPickerPending && !state.reviewSubmitting);
+    const reviewing = ready && state.reviewPage === "review";
+    document.body.classList.toggle("review-ready", ready);
+    // Code paths is offered only when this review has code-path data to show (loading, complete or a reported failure).
+    elements.explore_paths.classList.toggle("hidden", !state.payload?.decision_map);
+    elements.review_workflow.classList.toggle("hidden", !ready);
+    document.body.classList.toggle("reviewing", reviewing);
+    document.body.classList.toggle("reading-source", reviewing && !elements.source_panel.classList.contains("hidden"));
+    document.body.classList.toggle("workspace-exploring", Boolean(state.exploring));
+    elements.source_section.textContent = "Layer";
+    elements.source_section.title = reviewing && !state.exploring ? "Show this file's layer in the reading path" : "Show this code's section within its layer";
+    document.body.dataset.readingPane = state.readingPane;
+    elements.workflow_overview.setAttribute("aria-current", state.reviewPage === "overview" ? "page" : "false");
+    elements.workflow_review.setAttribute("aria-current", reviewing ? "page" : "false");
+    elements.workflow_finish.setAttribute("aria-current", state.reviewPage === "finish" ? "page" : "false");
+    document.body.classList.toggle("finishing-review", ready && state.reviewPage === "finish");
+    elements.review_finish.classList.toggle("hidden", !ready || state.reviewPage !== "finish");
+    elements.workflow_review.disabled = !ready || isEmptyReview(state.payload);
+    const meta = state.payload?.model?.metadata;
+    elements.workspace_target.textContent = meta ? `${meta.repo_root?.split(/[\\/]/).at(-1) || "Repository"} · ${
+        state.payload.review_target?.label || "Saved target"} · Base ${meta.base_sha?.slice(0, 8) || "empty"}` : "";
+    elements.workspace_target.title = meta?.repo_root || "";
+    elements.workspace_target.title = meta?.repo_root || "";
+    const narrow = matchMedia("(max-width: 900px)").matches;
+    const drawer = reviewing && narrow && state.navigationOpen;
+    elements.review_navigation.classList.toggle("hidden", !reviewing || Boolean(state.sourceFocused) || (narrow && !drawer));
+    elements.workspace_nav_toggle.setAttribute("aria-expanded", String(Boolean(drawer)));
+    elements.source_panel.inert = Boolean(drawer);
+    document.querySelector(".workspace").inert = Boolean(drawer);
+    for (const notice of [elements.error, elements.connection_notice, elements.worktree_notice]) notice.inert = Boolean(drawer);
+    elements.workspace_return_source.classList.toggle("hidden", !reviewing || !state.workspaceReturn
+        || !elements.source_panel.classList.contains("hidden"));
+    elements.workspace_code.setAttribute("aria-pressed", String(state.readingPane === "code"));
+    elements.workspace_context.setAttribute("aria-pressed", String(state.readingPane !== "code"));
+    if (ready) {
+        const height = Math.ceil(elements.review_workflow.getBoundingClientRect().height);
+        document.documentElement.style.setProperty("--workflow-height", `${height}px`);
+        let top = height;
+        if (reviewing) for (const notice of [elements.error, elements.connection_notice, elements.worktree_notice]) {
+            if (notice.classList.contains("hidden")) continue;
+            notice.style.top = `${top}px`;
+            top += Math.ceil(notice.getBoundingClientRect().height) + 6;
+        }
+        document.documentElement.style.setProperty("--workspace-top", `${top}px`);
+    }
+}
+function sourceScrollPosition() {
+    if (state.source && elements.source.clientHeight) {
+        state.source.scrollPosition = { top: elements.source.scrollTop, left: elements.source.scrollLeft };
+    }
+    return state.source?.scrollPosition || { top: 0, left: 0 };
+}
+
+function captureReturnFocus() {
+    let active = document.activeElement;
+    if (active?.closest(".workspace-explore")) active = active.closest(".workspace-explore").querySelector("summary");
+    const selector = active?.id ? `#${CSS.escape(active.id)}`
+        : active?.dataset.nodeId ? `[data-node-id="${CSS.escape(active.dataset.nodeId)}"]`
+            : active?.dataset.reviewId ? `[data-review-id="${CSS.escape(active.dataset.reviewId)}"]` : null;
+    const tag = active?.tagName, className = active?.getAttribute("class"), text = active?.textContent;
+    return () => {
+        const visible = (element) => element?.isConnected && element.getClientRects().length;
+        const target = visible(active) ? active : (selector && document.querySelector(selector))
+            || (tag && [...document.querySelectorAll(tag)].find((element) => visible(element)
+                && element.getAttribute("class") === className && element.textContent === text));
+        if (visible(target)) target.focus({ preventScroll: true });
+    };
+}
+
+const RETURN_FIELDS = ["reviewPage", "exploring", "mode", "selected", "source", "sourceTab", "readingPane", "discussionMode",
+    "sourceFocused", "sourceFocusReturn", "areaGroup", "activeReviewGroup", "navigationMode", "navigationQuery", "navigationOpen", "navigationCursor",
+    "query", "changedOnly", "detailVisible", "attribution", "attributionStatus", "attributionMessage", "workspaceReturn", "sourceReturnView",
+    "packageSelectionClosed", "sectionFocus", "sourceReturnFocus", "sourceOriginItemId"];
+function captureViewReturn(kind = "view") {
+    const visibleSource = !elements.source_panel.classList.contains("hidden");
+    return {
+        kind, generation: state.payload?.review_generation,
+        values: Object.fromEntries(RETURN_FIELDS.map((key) => [key, state[key]])),
+        stack: [...state.stack], impact: state.impact && { ...state.impact },
+        sourceHistory: { ...state.sourceHistory, entries: [...state.sourceHistory.entries] },
+        visibleSource, focus: captureReturnFocus(),
+        scroll: [elements.graph, elements.review_navigation, elements.detail.parentElement, elements.source,
+            elements.source_panel.querySelector(".source-side")].map((element) => ({ element, top: element.scrollTop, left: element.scrollLeft })),
+        windowScroll: scrollY,
+        label: visibleSource ? state.source?.path : state.reviewPage === "overview" ? "Overview"
+            : state.reviewPage === "finish" ? "Finish" : state.stack.at(-1)?.name || collectionTitle(state.mode),
+    };
+}
+function rememberViewReturn(kind = "view") {
+    state.viewHistory.push(captureViewReturn(kind));
+}
+async function restoreViewReturn(saved) {
+    if (!saved || saved.generation !== state.payload?.review_generation) {
+        state.viewHistory = [];
+        elements.workflow_overview.click();
+        return;
+    }
+    state.selectionEpoch++;
+    sourceRenderVersion++;
+    Object.assign(state, saved.values);
+    state.stack = [...saved.stack];
+    state.impact = saved.impact && { ...saved.impact };
+    state.sourceHistory = { ...saved.sourceHistory, entries: [...saved.sourceHistory.entries] };
+    elements.workspace_search.value = state.navigationQuery || "";
+    elements.review_search.value = state.query || "";
+    elements.changed_only.checked = state.changedOnly;
+    elements.source_panel.classList.toggle("hidden", !saved.visibleSource);
+    setDiscussionMode(Boolean(saved.values.discussionMode));
+    setDetailVisible(Boolean(saved.values.detailVisible));
+    render();
+    if (state.selected && saved.values.detailVisible && state.mode !== "impact" && state.mode !== "packages") renderDetail(state.selected);
+    const epoch = state.selectionEpoch;
+    if (saved.visibleSource) {
+        if (!await renderSource() || epoch !== state.selectionEpoch) return;
+        if (saved.values.discussionMode && state.selected) {
+            await discussionPane.open(state.selected, state.payload.review_generation);
+            if (epoch !== state.selectionEpoch) return;
+        }
+        setSourceFocus(Boolean(saved.values.sourceFocused));
+    }
+    for (const { element, top, left } of saved.scroll) { element.scrollTop = top; element.scrollLeft = left; }
+    window.scrollTo({ top: saved.windowScroll, behavior: "instant" });
+    saved.focus();
+}
+function returnPreviousView({ close = false } = {}) {
+    if (close) while (state.viewHistory.at(-1)?.kind === "level") state.viewHistory.pop();
+    return restoreViewReturn(state.viewHistory.pop()).catch(showError);
+}
+function rememberSourceOrigin({ overview = false } = {}) {
+    if ((state.exploring || (overview && state.reviewPage !== "review")) && elements.source_panel.classList.contains("hidden")) {
+        state.sourceReturnView = captureViewReturn();
+        state.sourceHistory = { entries: [], index: -1, pending: -1 };
+    }
+}
+
+for (const dialog of document.querySelectorAll("dialog")) {
+    let restoreFocus;
+    dialog.addEventListener("beforetoggle", (event) => {
+        if (event.newState === "open") restoreFocus = captureReturnFocus();
+    });
+    dialog.addEventListener("close", () => restoreFocus?.());
+}
+
+function rememberWorkspaceSource() {
+    if (!state.source || elements.source_panel.classList.contains("hidden")) return;
+    state.workspaceReturn = {
+        generation: state.payload.review_generation, source: state.source, selected: state.source.reviewItem || state.selected, tab: state.sourceTab,
+        history: { ...state.sourceHistory, entries: [...state.sourceHistory.entries] },
+        attribution: state.attribution, attributionStatus: state.attributionStatus, attributionMessage: state.attributionMessage,
+        scroll: { ...sourceScrollPosition(),
+            side: elements.source_panel.querySelector(".source-side").scrollTop },
+        discussion: state.discussionMode, pane: state.readingPane, cursor: viewedSourceLocation(),
+        group: state.activeReviewGroup, query: state.navigationQuery,
+    };
+}
+
+async function returnWorkspaceSource({ code = false } = {}) {
+    const saved = state.workspaceReturn;
+    if (!saved || saved.generation !== state.payload.review_generation) {
+        showError(new Error("The previous source belongs to another review snapshot."));
+        return;
+    }
+    state.reviewPage = "review";
+    state.viewHistory = [];
+    state.sourceReturnView = null;
+    state.exploring = false;
+    state.mode = "walkthrough";
+    state.source = saved.source;
+    state.selected = saved.selected;
+    state.sourceTab = saved.tab;
+    state.sourceHistory = { ...saved.history, entries: [...saved.history.entries] };
+    state.attribution = saved.attribution;
+    state.attributionStatus = saved.attributionStatus;
+    state.attributionMessage = saved.attributionMessage;
+    state.activeReviewGroup = saved.group;
+    state.readingPane = code ? "code" : saved.pane || "code";
+    state.navigationQuery = saved.query;
+    elements.workspace_search.value = saved.query || "";
+    state.selectionEpoch++;
+    setDiscussionMode(!code && Boolean(saved.discussion));
+    render();
+    if (await renderSource()) {
+        if (state.selected && state.annotationRequests.has(`${state.payload.review_generation}:${state.selected.id}`)) {
+            ensureAnnotation(state.selected);
+        }
+        elements.source.scrollTop = saved.scroll.top;
+        elements.source.scrollLeft = saved.scroll.left;
+        elements.source_panel.querySelector(".source-side").scrollTop = saved.scroll.side;
+        if (!code && saved.discussion && saved.selected) await discussionPane.open(saved.selected, state.payload.review_generation);
+        if (state.readingPane === "code") elements.source.focus({ preventScroll: true });
+        else if (!saved.discussion) elements.show_evidence.focus({ preventScroll: true });
+    }
+}
+
+elements.workflow_overview.addEventListener("click", () => {
+    state.selectionEpoch++;
+    sourceRenderVersion++;
+    rememberWorkspaceSource();
+    state.viewHistory = [];
+    state.sourceReturnView = null;
+    setSourceFocus(false);
+    state.reviewPage = "overview";
+    state.navigationOpen = false;
+    elements.source_panel.classList.add("hidden");
+    render();
+    flushReviewCursor();
+    elements.overview_start.focus({ preventScroll: true });
+});
+elements.workflow_review.addEventListener("click", () => {
+    if (state.reviewPage === "review" && !state.exploring) return;
+    if (state.workspaceReturn) returnWorkspaceSource().catch(showError);
+    else elements.overview_start.click();
+});
+elements.workflow_finish.addEventListener("click", () => openFinishReview());
+elements.workspace_return_source.addEventListener("click", () => returnWorkspaceSource({ code: true }).catch(showError));
+elements.workspace_find.addEventListener("click", openReviewCommands);
+elements.workspace_nav_toggle.addEventListener("click", () => {
+    state.navigationOpen = !state.navigationOpen;
+    renderWorkspaceShell();
+    if (state.navigationOpen) elements.workspace_search.focus();
+});
+for (const [button, mode] of [[elements.workspace_groups, "groups"], [elements.workspace_files, "files"]]) {
+    button.addEventListener("click", () => { state.navigationMode = mode; state.navigationKey = null; renderWorkspaceNavigation(); });
+}
+elements.workspace_search.addEventListener("input", () => {
+    state.navigationQuery = elements.workspace_search.value;
+    renderWorkspaceNavigation();
+});
+elements.workspace_group_retry.addEventListener("click", () => {
+    state.sectionError = null;
+    state.navigationKey = null;
+    renderWorkspaceNavigation();
+});
+document.querySelector(".workspace-explore").addEventListener("toggle", (event) => {
+    if (event.target.open && state.navigationOpen) {
+        state.navigationOpen = false;
+        renderWorkspaceShell();
+    }
+});
+for (const menu of document.querySelectorAll("details.workspace-explore")) {
+    document.addEventListener("pointerdown", (event) => {
+        if (menu.open && !menu.contains(event.target)) menu.open = false;
+    }, true);
+    document.addEventListener("keydown", (event) => {
+        if (event.key !== "Escape" || !menu.open) return;
+        menu.open = false;
+        if (menu.contains(document.activeElement)) menu.querySelector("summary")?.focus();
+        event.stopPropagation();
+    }, true);
+    document.addEventListener("focusin", (event) => {
+        if (menu.open && !menu.contains(event.target)) menu.open = false;
+    });
+}
+for (const [button, mode] of [[elements.explore_priorities, "walkthrough"], [elements.explore_concerns, "findings"], [elements.explore_groups, "sections"], [elements.explore_architecture, "graph"],
+    [elements.explore_paths, "decisions"], [elements.explore_packages, "packages"]]) {
+    button.addEventListener("click", () => {
+        rememberViewReturn();
+        rememberWorkspaceSource();
+        setSourceFocus(false);
+        state.reviewPage = "review";
+        state.exploring = true;
+        state.mode = mode;
+        state.stack = [];
+        clearSelection();
+        state.source = null;
+        elements.source_panel.classList.add("hidden");
+        button.closest("details").open = false;
+        render();
+    });
+}
+for (const [button, pane] of [[elements.workspace_code, "code"], [elements.workspace_context, "context"]]) {
+    button.addEventListener("click", () => {
+        const scroll = sourceScrollPosition();
+        state.readingPane = pane;
+        renderWorkspaceShell();
+        if (pane === "code") {
+            elements.source.scrollTop = scroll.top;
+            elements.source.scrollLeft = scroll.left;
+        }
+    });
+}
+
+const reviewStateLabel = (value) => Object.fromEntries(REVIEW_DISPOSITIONS)[value] || value;
+
+// One grounded AI intent line per layer; the deterministic summary stays visible until it arrives or if it fails.
+function ensureLayerSummaries() {
+    const generation = state.payload?.review_generation;
+    if (!state.payload || state.payload.annotations?.layers?.titles || state.layerSummaryRequested === generation) return;
+    state.layerSummaryRequested = generation;
+    state.layerSummaryError = null;
+    state.layerSummaryLoading = true;
+    api("/api/layer-summaries", { method: "POST", body: "{}" }).then((result) => {
+        if (state.payload?.review_generation !== generation) return;
+        state.payload.annotations = { ...(state.payload.annotations || {}), layers: result.annotation };
+    }, (error) => {
+        if (state.payload?.review_generation === generation) state.layerSummaryError = error.message;
+    }).finally(() => {
+        if (state.payload?.review_generation !== generation) return;
+        state.layerSummaryLoading = false;
+        state.navigationKey = null;
+        renderWorkspaceNavigation();
+        renderReviewOverview();
+    });
+}
+
+function layerSummaryStatus(container, layer, key) {
+    if (layer.supporting) return;
+    if (state.layerSummaryLoading && !state.payload.annotations?.layers?.titles) {
+        container.append(aiPlaceholder(key, "Copilot is writing layer titles and summaries...", 1));
+    } else if (state.layerSummaryError) {
+        const error = el("span", "layer-summary-error muted", `AI layer summary unavailable: ${state.layerSummaryError}`);
+        container.append(error);
+    }
+}
+
+// Long file names wrap at dots, dashes and underscores before ever breaking inside a word.
+function breakableName(text) {
+    const fragment = document.createDocumentFragment();
+    for (const part of String(text).split(/(?<=[._-])/)) fragment.append(document.createTextNode(part), document.createElement("wbr"));
+    return fragment;
+}
+
+function bulkReviewLink(entry, text) {
+    const mark = el("button", "link-button", text);
+    mark.type = "button";
+    mark.addEventListener("click", () => {
+        state.bulkReviewGroup = entry;
+        elements.group_review_error.classList.add("hidden");
+        elements.group_review_title.textContent = `Mark ${entry.files.length} files reviewed`;
+        elements.group_review_scope.textContent = `${entry.title}. This includes every changed file in this group, not just files matching the current filter. Existing notes are kept.`;
+        elements.group_review_confirm.disabled = !state.progressReady || savingDecision();
+        elements.group_review_dialog.showModal();
+    });
+    return mark;
+}
+
+function renderWorkspaceNavigation() {
+    if (!state.payload?.model || state.reviewPage !== "review") return;
+    const data = ensureSectionData();
+    const navigation = workspaceNavigation(state.payload.model, data);
+    state.workspaceNavigation = navigation;
+    const location = state.pendingSource || state.source || state.workspaceReturn?.source;
+    const group = groupForSource(navigation, location, state.activeReviewGroup);
+    if (group) state.activeReviewGroup = group.id;
+    const changedFile = location && navigation.files.some((file) => file.path === location.path);
+    const layer = group && navigation.layers.find((item) => item.id === group.layer);
+    const groupLabel = group?.label || group?.title;
+    // When the open file is a test or consumer listed under another file's group, name the open file first.
+    const primaryPath = group?.primaries?.[0];
+    const attachedRole = group && !group.cohort && location?.path && primaryPath && !group.primaries.includes(location.path)
+        && group.roles?.get?.(location.path);
+    const openLabel = attachedRole ? `${location.path.split("/").at(-1)} — ${attachedRole === "test" ? "test" : attachedRole === "consumer" ? "consumer" : "related file"} of ${primaryPath.split("/").at(-1)}` : null;
+    elements.workspace_group_label.textContent = group ? `${layer
+        ? `${layerLabel(layer)}${(openLabel || groupLabel) === layer.name ? "" : " › "}` : ""}${openLabel || (groupLabel === layer?.name ? "" : groupLabel)}`
+        : (changedFile ? "Changed file · this line is outside its grouped change ranges"
+            : state.source ? "Related source outside the changed-file groups" : "Choose a group or file");
+    const query = state.navigationQuery.toLowerCase().trim();
+    if (data) ensureLayerSummaries();
+    const key = `${state.payload.review_generation}:${state.sectionDataKey}:${state.navigationMode}:${query}:${state.payload.annotations?.layers?.generated_at || ""}:${state.layerSummaryLoading}:${state.layerSummaryError}`;
+    elements.workspace_groups.setAttribute("aria-pressed", String(state.navigationMode === "groups"));
+    elements.workspace_files.setAttribute("aria-pressed", String(state.navigationMode === "files"));
+    const storyLayers = navigation.layers.filter((item) => !item.supporting).length;
+    elements.workspace_count.textContent = `${countLabel(navigation.files.length, "changed file")} · ${
+        data ? countLabel(storyLayers || navigation.layers.length, "layer") : state.sectionError ? "Grouping unavailable; files remain accessible" : "Grouping saved changes…"}`;
+    elements.workspace_group_retry.classList.toggle("hidden", !state.sectionError);
+    if (state.navigationKey !== key) {
+        state.navigationKey = key;
+        const list = elements.workspace_nav_list;
+        list.replaceChildren();
+        const appendTree = (container, tree, owner) => {
+            for (const directory of [...tree.directories.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+                const details = el("details", "workspace-folder");
+                details.dataset.prefix = directory.path;
+                // A collapsed folder still says how much changed inside it.
+                const totals = treeTotals(directory);
+                const summary = el("summary", "", directory.name);
+                const meta = el("span", "workspace-folder-meta", `${countLabel(totals.files, "file")} · +${totals.added.toLocaleString()} −${totals.removed.toLocaleString()}`);
+                summary.title = `${directory.path}: ${countLabel(totals.files, "changed file")}, ${totals.added.toLocaleString()} added and ${totals.removed.toLocaleString()} removed lines`;
+                summary.prepend(meta);
+                details.append(summary);
+                appendTree(details, directory, owner);
+                if (query) details.open = true;
+                container.append(details);
+            }
+            for (const file of tree.files) {
+                const button = el("button", "workspace-file", file.path.split("/").at(-1));
+                button.type = "button";
+                button.dataset.path = file.path;
+                button.dataset.group = owner?.id || "";
+                button.title = file.path;
+                if (state.navigationMode === "files") {
+                    const layer = layerOf(navigation, { path: file.path });
+                    const meta = el("span", "workspace-file-meta");
+                    meta.append(el("span", "workspace-file-delta", `+${file.lines_added || 0} −${file.lines_removed || 0}`));
+                    if (layer) {
+                        const chip = layerMarker(layer, "layer-chip layer-chip-inline");
+                        chip.title = layerLabel(layer);
+                        meta.append(chip);
+                    }
+                    button.append(meta);
+                    button.dataset.delta = `${file.lines_added || 0} added, ${file.lines_removed || 0} removed lines`;
+                    button.title = `${file.path} · +${file.lines_added || 0} −${file.lines_removed || 0}${layer ? ` · ${layerLabel(layer)}` : ""}`;
+                }
+                button.addEventListener("click", () => openWorkspaceFile(file, owner).catch(showError));
+                container.append(button);
+            }
+        };
+        if (state.navigationMode === "files") {
+            appendTree(list, fileTree(navigation.files.filter((file) => !query || file.path.toLowerCase().includes(query))), null);
+        } else for (const layer of navigation.layers) {
+            const layerGroups = layer.groups.map((entry) => {
+                const matches = !query || `${entry.label} ${layer.name} ${layerTitle(layer)}`.toLowerCase().includes(query);
+                return { entry, files: entry.files.filter((file) => matches || file.path.toLowerCase().includes(query)) };
+            }).filter(({ files }) => files.length);
+            if (!layerGroups.length) continue;
+            const section = el("details", "workspace-layer");
+            section.open = true;
+            section.dataset.layer = layer.id;
+            const heading = el("summary", "workspace-layer-heading");
+            heading.title = "Expand or collapse this layer's files";
+            const name = el("span", "workspace-layer-name");
+            const title = layerTitle(layer);
+            const openTitle = el("button", "workspace-layer-open", "Review layer");
+            openTitle.type = "button";
+            openTitle.title = `Open ${layerLabel(layer)} at its next unreviewed file`;
+            openTitle.setAttribute("aria-label", `Review layer: ${layerLabel(layer)}`);
+            openTitle.addEventListener("click", (event) => {
+                event.preventDefault();
+                section.open = true;
+                openLayer(navigation, layer);
+            });
+            name.append(layerMarker(layer, "workspace-layer-number"),
+                titleWithBadge(title, title !== layer.name, "AI-written step title; the area name is shown below"));
+            const meta = el("span", "workspace-layer-meta");
+            if (title !== layer.name) meta.append(el("span", "", layer.name));
+            if (layer.path && layer.path !== "/" && !layer.supporting) meta.append(el("code", "", layer.path));
+            if (layer.number && layer.number > 1 && !layer.dependsOn.length) {
+                const independent = el("span", "layer-independent", "independent");
+                independent.title = "No changed file in this layer imports or calls an earlier layer; it can be read in any order.";
+                meta.append(independent);
+            }
+            for (const dependency of layer.dependsOn) {
+                meta.append(el("span", "workspace-layer-depends", `builds on ${dependencyLabel(navigation, dependency)} — ${dependency.example}`));
+            }
+            const progress = el("span", "workspace-layer-progress muted");
+            progress.dataset.layerProgress = layer.id;
+            const tests = el("span", "workspace-layer-tests");
+            tests.dataset.layerTests = layer.id;
+            const intent = state.payload.annotations?.layers?.intents?.[layer.id];
+            let intentLine = null;
+            if (intent) {
+                intentLine = el("span", "workspace-layer-intent");
+                intentLine.append(el("span", "workspace-layer-ai", "AI"), document.createTextNode(intent));
+                intentLine.title = `${intent}\n\nAI interpretation of this layer's saved diff. Verify in the code.`;
+            } else if (layer.summary) intentLine = el("span", "workspace-layer-intent workspace-layer-fallback", layer.summary);
+            heading.append(name, progress, tests, ...(intentLine ? [intentLine] : []), meta);
+            const actions = el("div", "workspace-layer-actions");
+            actions.append(openTitle);
+            layerSummaryStatus(actions, layer, `layer:${layer.id}`);
+            section.append(heading, actions);
+            for (const { entry, files } of layerGroups) {
+                if (entry.supporting) {
+                    const tree = el("div", "workspace-supporting");
+                    tree.dataset.group = entry.id;
+                    appendTree(tree, fileTree(files), entry);
+                    tree.append(bulkReviewLink(entry, "Review all supporting files…"));
+                    section.append(tree);
+                    continue;
+                }
+                if (entry.tree) {
+                    const details = el("details", "workspace-group");
+                    details.dataset.group = entry.id;
+                    const summary = el("summary", "");
+                    summary.append(el("strong", "", entry.title));
+                    summary.title = "Expand or collapse this group's files";
+                    const open = el("button", "workspace-group-open", "Review group");
+                    open.type = "button";
+                    open.title = entry.section?.summary || entry.title;
+                    open.addEventListener("click", (event) => {
+                        event.preventDefault();
+                        details.open = true;
+                        const first = entry.section?.ranges.find((range) => files.some((file) => file.path === range.path));
+                        openWorkspaceFile(files.find((file) => file.path === first?.path) || files[0], entry).catch(showError);
+                    });
+                    const count = el("span", "muted", String(files.length));
+                    count.dataset.groupProgress = entry.id;
+                    if (layer.groups.length > 1) summary.append(count);
+                    details.append(summary, open);
+                    appendTree(details, fileTree(files), entry);
+                    details.append(bulkReviewLink(entry, "Review all group files…"));
+                    if (query) details.open = true;
+                    section.append(details);
+                    continue;
+                }
+                const block = el("div", "workspace-file-group");
+                block.dataset.group = entry.id;
+                for (const file of files) {
+                    const role = entry.roles.get(file.path);
+                    const primary = role === "changed";
+                    const button = el("button", `workspace-file${primary ? " workspace-primary" : " workspace-attached"}`);
+                    button.type = "button";
+                    button.dataset.path = file.path;
+                    button.dataset.group = entry.id;
+                    button.dataset.role = role;
+                    if (primary && entry.subtitle && file.path === entry.primaries[0]) button.dataset.symbols = entry.subtitle;
+                    button.title = file.path;
+                    const label = el("span", "workspace-file-name");
+                    label.append(breakableName(file.path.split("/").at(-1)));
+                    button.append(label);
+                    if (primary && entry.subtitle && file.path === entry.primaries[0]) {
+                        const symbols = el("span", "workspace-file-symbols");
+                        symbols.append(breakableName(entry.subtitle));
+                        button.append(symbols);
+                    }
+                    if (!primary) button.append(el("span", "workspace-role", role));
+                    button.addEventListener("click", () => openWorkspaceFile(file, entry).catch(showError));
+                    block.append(button);
+                }
+                if (entry.related.length) {
+                    const related = el("span", "workspace-related muted", "Also changes ");
+                    entry.related.slice(0, 3).forEach((item, index) => {
+                        const target = navigation.groups.find((group) => group.id === item.group);
+                        const link = el("button", "link-button", item.path.split("/").at(-1));
+                        link.type = "button";
+                        link.title = `Open ${item.path}, listed with its own file`;
+                        link.addEventListener("click", () => {
+                            const file = target?.files.find((candidate) => candidate.path === item.path);
+                            if (file) openWorkspaceFile(file, target).catch(showError);
+                        });
+                        related.append(...(index ? [document.createTextNode(", ")] : []), link);
+                    });
+                    if (entry.related.length > 3) related.append(document.createTextNode(` +${entry.related.length - 3}`));
+                    related.append(document.createTextNode(" (listed with its own file)"));
+                    block.append(related);
+                }
+                section.append(block);
+            }
+            list.append(section);
+        }
+        if (!list.childElementCount) list.append(el("p", "muted", "No changed files match this filter."));
+    }
+    for (const button of elements.workspace_nav_list.querySelectorAll(".workspace-file")) {
+        const selected = button.dataset.path === location?.path
+            && (state.navigationMode === "files" || button.dataset.group === state.activeReviewGroup);
+        button.classList.toggle("is-selected", selected);
+        if (selected) {
+            button.setAttribute("aria-current", "location");
+            for (let parent = button.parentElement; parent && parent !== elements.workspace_nav_list; parent = parent.parentElement) {
+                if (parent.tagName === "DETAILS") parent.open = true;
+            }
+        } else button.removeAttribute("aria-current");
+        const disposition = state.reviewLedger.get(fileReviewId(button.dataset.path))?.disposition || "pending";
+        button.dataset.reviewState = disposition;
+        button.setAttribute("aria-label", `${button.dataset.path}${button.dataset.role && button.dataset.role !== "changed" ? `, ${button.dataset.role}` : ""}${
+            button.dataset.symbols ? `, changes ${button.dataset.symbols}` : ""}${button.dataset.delta ? `, ${button.dataset.delta}` : ""} · ${reviewStateLabel(disposition)}`);
+    }
+    const reviewedIn = (files) => files.filter((file) => state.reviewLedger.get(fileReviewId(file.path))?.disposition === "reviewed").length;
+    for (const count of elements.workspace_nav_list.querySelectorAll("[data-group-progress]")) {
+        const entry = navigation.groups.find((group) => group.id === count.dataset.groupProgress);
+        if (entry) count.textContent = `${reviewedIn(entry.files)}/${entry.files.length}`;
+    }
+    for (const count of elements.workspace_nav_list.querySelectorAll("[data-layer-progress]")) {
+        const entry = navigation.layers.find((layer) => layer.id === count.dataset.layerProgress);
+        const files = entry?.groups.flatMap((group) => group.files) || [];
+        count.textContent = `${reviewedIn(files)}/${files.length}`;
+        count.title = `${reviewedIn(files)} of ${countLabel(files.length, "file")} in this layer marked reviewed`;
+    }
+    for (const slot of elements.workspace_nav_list.querySelectorAll("[data-layer-tests]")) {
+        const entry = navigation.layers.find((layer) => layer.id === slot.dataset.layerTests);
+        const chip = entry && layerTestChip(entry);
+        slot.replaceChildren(...(chip ? [chip] : []));
+    }
+}
+
+async function openWorkspaceFile(file, group = null) {
+    rememberCurrentSource();
+    state.viewHistory = [];
+    state.sourceReturnView = null;
+    state.reviewPage = "review";
+    state.exploring = false;
+    state.readingPane = "code";
+    state.navigationOpen = false;
+    state.activeReviewGroup = group?.id || null;
+    state.navigationCursor = { path: file.path, group: group?.id || null };
+    state.mode = "walkthrough";
+    // Show the destination immediately; slow source loads must not look like ignored key presses.
+    const pending = { path: file.path };
+    state.pendingSource = pending;
+    elements.source_title.textContent = `${file.path} · loading…`;
+    renderSourcePosition(file.path);
+    elements.source.setAttribute("aria-busy", "true");
+    renderWorkspaceNavigation();
+    renderFileReview();
+    const range = group?.section?.ranges.find((range) => range.path === file.path && range.side !== "base")
+        || group?.section?.ranges.find((range) => range.path === file.path);
+    const node = range?.symbol_id && state.payload.model.nodes.find((node) => node.id === range.symbol_id);
+    try {
+        if (node) await selectItem(node, false);
+        // Generated bundles are not sent to Copilot; every other file gets its explanation.
+        else await selectFile(file, !file.generated);
+    } finally {
+        if (state.pendingSource === pending) {
+            state.pendingSource = null;
+            renderFileReview();
+            if (state.source?.path !== file.path) {
+                elements.source.removeAttribute("aria-busy");
+                elements.source_title.textContent = state.source
+                    ? `${state.source.path}${state.source.start_line ? `:${state.source.start_line}` : ""}` : "";
+                renderWorkspaceNavigation();
+            }
+        }
+    }
+    if (state.navigationCursor?.path !== file.path) return;
+    renderWorkspaceShell();
+    if (state.source) elements.source.focus({ preventScroll: true });
+}
+
+function setDiscussionMode(active) {
+    sourceScrollPosition();
+    state.discussionMode = active;
+    elements.source_panel.querySelector(".source-side").classList.toggle("discussion-mode", active);
+    elements.show_evidence.setAttribute("aria-pressed", String(!active));
+    elements.show_discussion.setAttribute("aria-pressed", String(active));
+    if (!active) {
+        discussionPane.hide();
+        elements.source_panel.querySelector(".source-side").scrollTop = 0;
+    }
+    if (active) state.readingPane = "context";
+    renderWorkspaceShell();
+}
+
+function renderSectionEvidence() {
+    const section = state.sectionData?.sections.find((section) => section.id === state.selected?.id);
+    if (!section || !state.source) return false;
+    rememberAnnotationDisclosures();
+    state.annotationView = null;
+    const panel = elements.source_annotation;
+    panel.replaceChildren(el("h3", "", section.title),
+        el("p", "muted", section.summary_citations.length ? "Section-level AI interpretation; verify the cited source." : "Source-derived section context, not a defect finding."),
+        el("p", "", section.summary),
+        el("p", "muted", `Viewed source: ${state.source.path}:${state.source.start_line || 1}. The section contains ${countLabel(section.ranges.length, "source range")}.`));
+    for (const citation of section.summary_citations) panel.append(sourceReferenceButton(
+        `${citation.path}:${citation.line}`, { path: citation.path, lines: [citation.line], side: citation.side }));
+    panel.classList.remove("hidden");
+    return true;
+}
+
+function rememberSourceReturnFocus() {
+    const active = document.activeElement;
+    if (!active || active === document.body || elements.source_panel.contains(active)
+        || active.closest("#detail, dialog")) return;
+    state.sourceReturnFocus = active;
+    state.sourceOriginItemId = active.closest("[data-item-id]")?.dataset.itemId || state.selected?.id || null;
+}
+
+function setSourceFocus(active) {
+    if (active && (!state.source || elements.source_focus.disabled)) {
+        showError(new Error("Open a saved source range before focusing code."));
+        return;
+    }
+    const wasActive = Boolean(state.sourceFocused);
+    if (active && !wasActive) state.sourceFocusReturn = {
+        source: state.source, pane: state.readingPane, side: elements.source_panel.querySelector(".source-side").scrollTop,
+    };
+    const previous = !active && wasActive && state.sourceFocusReturn?.source === state.source ? state.sourceFocusReturn : null;
+    state.sourceFocused = active;
+    document.body.classList.toggle("review-source-focus", active);
+    elements.source_focus.setAttribute("aria-pressed", String(active));
+    elements.source_focus.textContent = active ? "Exit focus" : "Focus code";
+    elements.source_focus.title = active ? "Exit focus mode (F or Esc)" : "Hide the rail and context; keep Mark & next (F)";
+    if (active) state.readingPane = "code";
+    else if (previous) state.readingPane = previous.pane;
+    renderWorkspaceShell();
+    if (previous) elements.source_panel.querySelector(".source-side").scrollTop = previous.side;
+}
+
+elements.source_focus.addEventListener("click", () => setSourceFocus(!state.sourceFocused));
+
+const commandCatalogs = new WeakMap();
+function focusedReviewItem() {
+    if (!state.payload?.model) return null;
+    const active = document.activeElement;
+    const changedFile = active.closest?.(".workspace-file")?.dataset.path;
+    if (changedFile) return { id: `file:${changedFile}`, kind: "file", path: changedFile, name: changedFile };
+    const sectionId = active.closest?.(".section-card")?.dataset.sectionId;
+    const section = state.sectionData?.sections.find((section) => section.id === sectionId);
+    if (section) return { id: section.id, kind: "section", title: section.title, path: section.ranges[0].path };
+    const id = active.closest?.("[data-item-id]")?.dataset.itemId || active.closest?.("[data-node-id]")?.dataset.nodeId;
+    if (id) return [...state.payload.model.nodes, ...state.payload.model.attention || [],
+        ...state.payload.model.package_changes || [], ...state.payload.model.package_dependencies || [],
+        ...state.payload.generated_observations || []].find((item) => item.id === id) || state.selected;
+    return state.selected || (state.source ? { id: `file:${state.source.path}`, kind: "file", path: state.source.path, name: state.source.path } : null);
+}
+
+function viewedSourceLocation() {
+    if (!state.source || elements.source_panel.classList.contains("hidden")) return null;
+    const selection = window.getSelection();
+    const selected = !selection?.isCollapsed && selection?.anchorNode?.parentElement?.closest(".code-row");
+    const box = elements.source.getBoundingClientRect();
+    const focus = elements.source.querySelector(".focus-start");
+    const focusBox = focus?.getBoundingClientRect();
+    const focused = focusBox && focusBox.bottom > Math.max(0, box.top)
+        && focusBox.top < Math.min(innerHeight, box.bottom) ? focus : null;
+    const probe = document.elementFromPoint(Math.min(innerWidth - 8, box.left + 80),
+        Math.max(8, Math.min(innerHeight - 8, box.top + 12)))?.closest(".code-row, .split-pair");
+    // In split diffs the probe can land on an empty filler; use the line beside it.
+    const visible = probe?.classList.contains("split-pair") ? probe.querySelector(".code-row.diff-add, .code-row") : probe;
+    const row = selected && elements.source.contains(selected) ? selected : focused || visible;
+    if (!row && state.source.viewedLocationTab === state.sourceTab && state.source.viewedLocation) {
+        return state.source.viewedLocation;
+    }
+    const preferredSide = state.source.focus_side || "current";
+    const side = state.sourceTab === "base" ? "base" : state.sourceTab === "current" ? "current"
+        : row?.dataset[preferredSide === "base" ? "oldLine" : "newLine"] ? preferredSide
+        : row?.dataset.newLine ? "current" : row?.dataset.oldLine ? "base" : preferredSide;
+    const line = Number(row?.dataset[side === "base" ? "oldLine" : "newLine"])
+        || Number(row?.dataset.gap?.split("-")[0]) || Number(state.source.start_line) || 1;
+    if (typeof state.source[side] !== "string") return null;
+    state.source.viewedLocation = { path: state.source.path, line, side };
+    state.source.viewedLocationTab = state.sourceTab;
+    return state.source.viewedLocation;
+}
+
+function renderReviewCommands() {
+    const model = state.payload?.model;
+    if (!model) return;
+    if (!commandCatalogs.has(model)) commandCatalogs.set(model, reviewCommands(model));
+    const query = elements.review_command_query.value.trim().toLowerCase();
+    const prefix = (item) => Number(item.title.toLowerCase().startsWith(query));
+    // Typed searches still keep the change set ahead of unchanged repository symbols.
+    const matches = commandCatalogs.get(model).filter((item) => query
+        ? `${item.title} ${item.path || ""} ${item.reason || ""}`.toLowerCase().includes(query) : item.rank < 3)
+        .sort((a, b) => Number(a.rank >= 3) - Number(b.rank >= 3) || prefix(b) - prefix(a)
+            || a.rank - b.rank || a.title.localeCompare(b.title));
+    elements.review_command_count.textContent = query
+        ? `Showing ${Math.min(30, matches.length)} of ${matches.length.toLocaleString()} matching review items · Enter opens the first`
+        : `Showing ${Math.min(30, matches.length)} of ${matches.length.toLocaleString()} concerns and changed items · type to search all symbols`;
+    const rows = [];
+    for (const item of matches.slice(0, 30)) {
+        const row = el("li", "");
+        const open = el("button", "");
+        open.type = "button";
+        open.append(el("strong", "", item.title), el("small", "muted", `${item.label} · ${item.path || "Saved review evidence"}`));
+        open.addEventListener("click", async () => {
+            elements.review_command_palette.close();
+            state.sourceReturnFocus = elements.review_command_open;
+            try {
+                if (item.kind === "file") await selectFile(model.changes.find((change) => `file:${change.path}` === item.id), false);
+                else await selectItem(item, false, false);
+                if (state.selected?.id === item.id && state.source) elements.source.focus({ preventScroll: true });
+            } catch (error) { showError(error); }
+        });
+        open.addEventListener("keydown", (event) => {
+            if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
+            event.preventDefault();
+            const buttons = [...elements.review_command_results.querySelectorAll("button")];
+            const next = buttons.indexOf(open) + (event.key === "ArrowDown" ? 1 : -1);
+            (buttons[next] || elements.review_command_query).focus();
+        });
+        row.append(open);
+        rows.push(row);
+    }
+    if (!rows.length) rows.push(el("li", "muted", "No files, symbols, or findings match this query."));
+    elements.review_command_results.replaceChildren(...rows);
+}
+
+function openReviewCommands() {
+    if (!state.payload?.model) {
+        showError(new Error("Wait for the saved review to load before searching it."));
+        return;
+    }
+    state.commandReturnFocus = document.activeElement === document.body
+        ? state.reviewPage === "review" ? elements.workspace_find : elements.review_command_open : document.activeElement;
+    elements.review_command_query.value = "";
+    renderReviewCommands();
+    if (!elements.review_command_palette.open) elements.review_command_palette.showModal();
+    elements.review_command_query.focus();
+}
+
+elements.review_command_open.addEventListener("click", openReviewCommands);
+elements.review_command_close.addEventListener("click", () => elements.review_command_palette.close());
+elements.review_command_palette.addEventListener("close", () => {
+    if (state.commandReturnFocus?.isConnected) state.commandReturnFocus.focus({ preventScroll: true });
+});
+elements.review_command_palette.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    elements.review_command_palette.close();
+});
+elements.review_command_query.addEventListener("input", renderReviewCommands);
+elements.review_command_query.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+        event.preventDefault();
+        elements.review_command_results.querySelector("button")?.click();
+        return;
+    }
+    if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
+    event.preventDefault();
+    const buttons = [...elements.review_command_results.querySelectorAll("button")];
+    (event.key === "ArrowDown" ? buttons[0] : buttons.at(-1))?.focus();
+});
+
+elements.source_location.addEventListener("click", async () => {
+    if (!state.source || elements.source_location.disabled) return;
+    try {
+        const viewed = viewedSourceLocation();
+        if (!viewed) throw new Error("This snapshot side has no source location to copy.");
+        const snapshot = state.reviewLedgerStorageKey || reviewSnapshotKey(state.payload.model, state.payload.review_target);
+        const link = reviewLocation(location.href, { snapshot, item: state.selected?.id,
+            ...viewed, tab: state.sourceTab });
+        await navigator.clipboard.writeText(link);
+        elements.source_location.textContent = "Location copied";
+        setTimeout(() => { elements.source_location.textContent = "Copy location"; }, 1500);
+    } catch (error) { showError(new Error(`Unable to copy review location: ${error.message}`)); }
+});
+
+async function applyReviewLocation() {
+    if (!state.payload?.model || state.payload.loading || !location.hash) return;
+    const generation = state.payload.review_generation;
+    const key = `${generation}:${location.hash}`;
+    if (state.appliedReviewLocation === key) return;
+    state.appliedReviewLocation = key;
+    try {
+        const target = parseReviewLocation(location.hash);
+        if (!target) return;
+        const snapshot = state.reviewLedgerStorageKey || reviewSnapshotKey(state.payload.model, state.payload.review_target);
+        if (target.snapshot !== snapshot) throw new Error("This local link belongs to another source snapshot. Select the original saved target before reopening it; newer code was not substituted.");
+        if (!Object.hasOwn(state.payload.model.source_files || {}, target.path)) throw new Error("The linked path is not available in this saved snapshot.");
+        let item = [...state.payload.model.nodes, ...state.payload.model.attention || [], ...state.payload.model.package_changes || []]
+            .find((item) => item.id === target.item);
+        if (target.item?.startsWith("section:")) {
+            const data = await api("/api/review-sections");
+            if (state.payload.review_generation !== generation) return;
+            const section = data.sections.find((section) => section.id === target.item);
+            if (!section) throw new Error("The linked section is not available in this review.");
+            state.sectionData = data;
+            item = { id: section.id, kind: "section", title: section.title, path: target.path };
+        }
+        if (!item && target.item && !target.item.startsWith("file:")) {
+            if (state.payload.model.evidence?.[target.item]) item = { id: target.item, kind: "evidence", path: target.path };
+            else throw new Error("The linked review item is not available in this analysis.");
+        }
+        setDiscussionMode(false);
+        state.selected = item || { id: `file:${target.path}`, kind: "file", name: target.path, path: target.path };
+        state.sourceReturnFocus = elements.review_command_open;
+        markSelectedCards();
+        if (state.selected.kind === "file") {
+            renderEmptyDetail();
+            setDetailVisible(false);
+        } else renderDetail(state.selected);
+        const epoch = ++state.selectionEpoch;
+        const query = new URLSearchParams({ path: target.path, line: String(target.line), side: target.side });
+        if (await loadSource(query.toString(), epoch, target.tab)) elements.source.focus({ preventScroll: true });
+    } catch (error) {
+        if (state.payload.review_generation === generation) {
+            if (!elements.source_panel.classList.contains("hidden")) elements.source_close.click();
+            showError(error);
+            elements.error.tabIndex = -1;
+            elements.error.focus({ preventScroll: true });
+            elements.error.scrollIntoView({ block: "center" });
+        }
+    }
+}
+
+window.addEventListener("hashchange", () => {
+    state.appliedReviewLocation = null;
+    applyReviewLocation().catch(showError);
+});
+
+async function discussItem(item = state.selected) {
+    state.reviewPage = "review";
+    setSourceFocus(false);
+    rememberSourceReturnFocus();
+    if (!item?.id) {
+        showError(new Error("Select a review item or source range to discuss."));
+        return;
+    }
+    if (state.selected?.id !== item.id || !state.source) await selectItem(item, false, false);
+    if (state.selected?.id !== item.id) return;
+    const names = new Map((state.payload?.model?.nodes || []).map((node) => [node.id, node.name]));
+    const dependency = [...state.payload?.model?.package_changes || [], ...state.payload?.model?.package_dependencies || []]
+        .find((dependency) => dependency.id === (item.package_id || item.id));
+    const title = dependency ? `${dependency.name} · ${packageVersionText(dependency)} — ${item.title || "Dependency"}`
+        : item.title || item.name || (item.source
+        ? `${names.get(item.source) || item.source} ${item.type} ${names.get(item.target) || item.target}` : item.id);
+    elements.source_panel.classList.toggle("no-source", !state.source);
+    if (!state.source) {
+        elements.source_title.textContent = title;
+        elements.source.replaceChildren(el("p", "muted", "This item has no direct source range. Discussion uses its saved relationship evidence."));
+        elements.source_ruler.classList.add("hidden");
+        elements.source_context_notice.classList.add("hidden");
+        for (const panel of [elements.source_provenance, elements.source_annotation, elements.source_decisions, elements.source_risk,
+            elements.source_review_context, elements.source_origin, elements.file_review_form, elements.source_coverage]) {
+            panel.classList.add("hidden");
+        }
+        elements.source_panel.classList.remove("hidden");
+        renderWorkspaceNavigation();
+        renderWorkspaceShell();
+    }
+    viewedSourceLocation();
+    setDiscussionMode(true);
+    renderWorkspaceNavigation();
+    renderWorkspaceShell();
+    await discussionPane.open({ ...item, title }, state.payload?.review_generation);
+}
+
+elements.show_evidence.addEventListener("click", () => setDiscussionMode(false));
+elements.show_discussion.addEventListener("click", () => discussItem().catch(showError));
+elements.workspace_discuss.addEventListener("click", () => discussItem().catch(showError));
+elements.workspace_comment.addEventListener("click", () => commentOnCurrentLine());
 
 function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -77,19 +1120,7 @@ const REVEAL_MS = 450;
 // Shimmering placeholder in the shape of the content that will replace it.
 function aiPlaceholder(key, label, lines = 3) {
     pendingAi.add(key);
-    const wrapper = el("div", "ai-pending");
-    wrapper.setAttribute("role", "status");
-    wrapper.setAttribute("aria-live", "polite");
-    const heading = el("p", "ai-pending-label");
-    heading.append(el("span", "ai-pending-dot"), document.createTextNode(label));
-    wrapper.append(heading);
-    const widths = [94, 81, 88, 67, 90, 74];
-    for (let index = 0; index < lines; index++) {
-        const bar = el("span", "ai-pending-line");
-        bar.style.width = `${widths[index % widths.length]}%`;
-        wrapper.append(bar);
-    }
-    return wrapper;
+    return activityPlaceholder(label, lines);
 }
 
 // Animate a result in only when it replaces a placeholder the reader saw. Server updates
@@ -164,6 +1195,10 @@ function metric(label, value, detail, mode) {
     card.type = "button";
     card.append(el("strong", "", value ?? 0), el("span", "", label), el("small", "", detail));
     card.addEventListener("click", () => {
+        rememberViewReturn();
+        rememberWorkspaceSource();
+        state.reviewPage = "review";
+        state.exploring = true;
         state.mode = mode;
         state.stack = [];
         clearSelection();
@@ -199,6 +1234,10 @@ function deltaMetric(label, added, removed, detail, mode, modified = null) {
     card.type = "button";
     card.append(value, el("span", "", label), el("small", "", detail));
     card.addEventListener("click", () => {
+        rememberViewReturn();
+        rememberWorkspaceSource();
+        state.reviewPage = "review";
+        state.exploring = true;
         state.mode = mode;
         state.stack = [];
         clearSelection();
@@ -231,46 +1270,75 @@ function renderSummary(model) {
     const packageDetail = (model.package_changes || []).slice(0, 2).map((item) =>
         `${item.name} ${item.resolved_current || item.declared_current?.map((entry) => entry.specifier).filter(Boolean).join(", ") || item.change}`
     ).join(" · ") || "No dependency changes";
-    elements.summary.replaceChildren(
+    elements.summary.replaceChildren(...[
         deltaMetric("Files", summary.files_added, summary.files_removed, fileDetail, "files", summary.files_modified || 0),
         deltaMetric("Lines", summary.lines_added, summary.lines_removed,
-            `source ${split.source.toLocaleString()} · tests ${split.tests.toLocaleString()} lines changed`, "lines"),
-        decisionMetric(state.payload?.decision_map),
+            `source ${countLabel(split.source, "line")} · tests ${countLabel(split.tests, "line")} changed`, "lines"),
+        state.payload?.decision_map ? decisionMetric(state.payload.decision_map) : null,
         deltaMetric("Architecture edges", summary.new_arch_edges, summary.arch_edges_removed, topEdge
             ? `Largest: ${moduleName(topEdge.source)} → ${moduleName(topEdge.target)}`
             : "No module relationship changes", "edges"),
         deltaMetric("Packages", summary.new_packages, summary.packages_removed, packageDetail, "packages", summary.packages_modified || 0),
-    );
+    ].filter(Boolean));
+    const edges = (summary.new_arch_edges || 0) + (summary.arch_edges_removed || 0);
+    const packages = (summary.new_packages || 0) + (summary.packages_removed || 0) + (summary.packages_modified || 0);
+    elements.overview_stats.textContent = [
+        `+${(summary.lines_added || 0).toLocaleString()} −${(summary.lines_removed || 0).toLocaleString()} lines`,
+        edges ? `${countLabel(edges, "architecture edge")} changed` : "no architecture changes",
+        packages ? `${countLabel(packages, "package change")}` : "no package changes",
+    ].join(" · ");
     const qualityIssues = [];
     const historical = ["commit", "pr"].includes(state.payload?.review_target?.mode);
-    const warnings = (model.warnings || []).filter((warning) => !historical
-        || warning !== "Worktree coverage is not applicable to a historical commit or PR snapshot.");
+    // Count every analyzer note so the Overview, Evidence and the handoff agree.
+    const warnings = model.warnings || [];
     const coverageOptions = [];
     if (meta.node_loc !== undefined) coverageOptions.push("source-matched LCOV/Istanbul JSON");
     if (meta.go_loc !== undefined) coverageOptions.push("a Go coverprofile with coverage.sources.json hashes");
     if (meta.rust_loc !== undefined) coverageOptions.push("LCOV plus rust-coverage.json with the exact revision and SHA-256 source hashes");
+    if (meta.cpp_loc !== undefined) coverageOptions.push("LCOV plus cpp-coverage.json with the exact revision and SHA-256 source hashes");
     if (meta.python_loc || !coverageOptions.length) coverageOptions.push("Python coverage.json/coverage.xml");
     if (meta.csharp_loc !== undefined) coverageOptions.push("saved Coverlet Cobertura XML");
     const coveragePrerequisite = `Provide ${coverageOptions.join(" or ")}`;
     if (!model.coverage?.available) qualityIssues.push(historical
         ? "Coverage is unavailable for this historical snapshot. Working-tree coverage reports are not applied to commit or PR reviews."
         : `No usable coverage report for this worktree snapshot. ${coveragePrerequisite}, then Reanalyze.`);
-    if (warnings.length) qualityIssues.push(`${warnings.length} static-analysis note${warnings.length === 1 ? "" : "s"} describe what could not be verified.`);
+    const notes = summarizeAnalysisWarnings(warnings);
+    if (notes.other.length) qualityIssues.push(
+        `${countLabel(notes.other.length, "static-analysis note")} ${plural(notes.other.length, "describes", "describe")} what could not be verified.`);
+    if (notes.unlinked) qualityIssues.push(unlinkedSentence(notes));
+    elements.overview_limitation.replaceChildren();
+    elements.overview_limitation.classList.toggle("hidden", !qualityIssues.length);
     if (qualityIssues.length) {
-        const quality = el("button", "quality-warning");
-        quality.type = "button";
-        quality.append(el("strong", "", !model.coverage?.available && !warnings.length ? "Coverage unavailable" : "Analysis limitation"), el("span", "", qualityIssues.join(" ")));
-        quality.addEventListener("click", () => {
+        const title = meta.analysis_incomplete ? "Analysis incomplete"
+            : !model.coverage?.available && !warnings.length ? "Coverage unavailable" : "Analysis limitation";
+        const openLimitations = () => {
+            if (state.reviewPage !== "review" || !state.exploring) rememberViewReturn();
             state.selected = {
                 id: "analysis-quality", kind: "analysis", name: "Analysis limitations",
                 reason: qualityIssues.join("\n"),
-                analysis_warnings: warnings,
+                analysis_warnings: notes.ordered,
             };
+            // The detail pane lives in the workspace; open it there so the limitation is visible in one click.
+            if (state.reviewPage !== "review" || !state.exploring) {
+                rememberWorkspaceSource();
+                state.reviewPage = "review";
+                state.exploring = true;
+                state.mode = "findings";
+                state.stack = [];
+                elements.source_panel.classList.add("hidden");
+                render();
+            }
+            setDetailVisible(true);
             renderDetail(state.selected);
-        });
-        elements.summary.append(quality);
+            elements.detail.tabIndex = -1;
+            elements.detail.focus({ preventScroll: true });
+        };
+        const details = el("button", "link-button", "Details");
+        details.type = "button";
+        details.addEventListener("click", openLimitations);
+        elements.overview_limitation.append(el("strong", "", title), el("span", "", qualityIssues.join(" ")), details);
     }
-    elements.summary.title = `${meta.base_ref || "base"} @ ${(meta.base_sha || "").slice(0, 8)} → ${(meta.head_sha || "").slice(0, 8)} · ${meta.python_loc || 0} Python LOC${meta.node_loc !== undefined ? ` · ${meta.node_loc} JavaScript/TypeScript LOC` : ""}${meta.csharp_loc != null ? ` · ${meta.csharp_loc} C# LOC` : ""}${meta.go_loc != null ? ` · ${meta.go_loc} Go LOC` : ""}${meta.rust_loc != null ? ` · ${meta.rust_loc} Rust LOC` : ""}`;
+    elements.summary.title = `${meta.base_ref || "base"} @ ${(meta.base_sha || "").slice(0, 8)} → ${(meta.head_sha || "").slice(0, 8)} · ${meta.python_loc || 0} Python LOC${meta.node_loc !== undefined ? ` · ${meta.node_loc} JavaScript/TypeScript LOC` : ""}${meta.csharp_loc != null ? ` · ${meta.csharp_loc} C# LOC` : ""}${meta.go_loc != null ? ` · ${meta.go_loc} Go LOC` : ""}${meta.rust_loc != null ? ` · ${meta.rust_loc} Rust LOC` : ""}${meta.cpp_loc != null ? ` · ${meta.cpp_loc} C/C++ LOC` : ""}`;
 }
 
 function evidenceLabel(id) {
@@ -282,15 +1350,18 @@ function evidenceLabel(id) {
 }
 
 function evidenceButton(id) {
-    const button = el("button", "evidence-link", evidenceLabel(id));
+    const button = el("button", "evidence-link");
+    // Long paths wrap at separators rather than inside a file name or line number.
+    for (const part of String(evidenceLabel(id)).split(/(?<=[/._\- ])/)) button.append(document.createTextNode(part), document.createElement("wbr"));
     button.type = "button";
     button.title = id;
     button.addEventListener("click", () => selectItem({ id, kind: "evidence" }, false));
     return button;
 }
 
-async function copyText(button, text) {
+async function copyText(button, text, onError = showError) {
     const originalLabel = button.getAttribute("aria-label") || "Copy";
+    const originalText = button.textContent;
     try {
         let copied = false;
         if (navigator.clipboard?.writeText) {
@@ -307,23 +1378,25 @@ async function copyText(button, text) {
             textarea.style.position = "fixed";
             textarea.style.opacity = "0";
             document.body.append(textarea);
+            const focus = document.activeElement;
             try {
                 textarea.select();
                 if (!document.execCommand("copy")) throw new Error("The browser rejected the copy command.");
             } finally {
                 textarea.remove();
+                focus?.focus({ preventScroll: true });
             }
         }
         button.textContent = "✓";
         button.setAttribute("aria-label", "Copied");
         button.title = "Copied";
         setTimeout(() => {
-            button.textContent = "⧉";
+            button.textContent = originalText;
             button.setAttribute("aria-label", originalLabel);
             button.title = originalLabel;
         }, 1500);
     } catch (error) {
-        showError(new Error(`Unable to copy text: ${error.message}`));
+        onError(new Error(`Unable to copy text: ${error.message}`));
     }
 }
 
@@ -344,34 +1417,120 @@ function renderCards(container, items, emptyText) {
     }
     for (const item of items) {
         const card = el("button", `review-card severity-${item.severity || item.change || "info"}`);
+        const signal = reviewSignal(item);
+        if (container === elements.attention) card.classList.add(`signal-${signal.kind}`);
         card.type = "button";
         const heading = el("div", "card-heading");
         heading.append(el("strong", "", item.title || item.name || item.id));
-        if (item.impact_score != null) {
-            const priority = el("b", "impact-score", `Priority ${item.impact_score}/100`);
-            priority.title = "Review priority based on change impact. This is not a vulnerability count or package security score.";
+        if (container === elements.attention) heading.append(el("span", "signal-label", signal.label));
+        const priorityValue = item.impact_score != null || item.node_id || item.package_id ? concernPriority(item) : null;
+        if (priorityValue != null) {
+            const priority = el("b", "impact-score", `Static priority ${priorityValue}/100`);
+            priority.title = "Deterministic static priority (not an AI judgement or a security score). Concerns in the focused queue also weigh churn, caller reach and test evidence; others use the analyzer's impact score. The same number appears on the code strip, Attention and the handoff.";
             heading.append(priority);
         }
-        card.append(heading, el("span", "card-body", item.id?.startsWith("package:") ? `${item.change} · Version ${packageVersionText(item)}` : item.body || item.reason || item.change || ""));
+        card.append(heading, el("span", "card-body", conciseReviewText(item.id?.startsWith("package:") ? `${item.change} · Version ${packageVersionText(item)}` : item.body || item.reason || item.change || "")));
+        if (container === elements.attention) {
+            const evidence = reviewItemEvidence(state.payload.model, item, state.payload.decision_map, state.payload.test_run);
+            card.append(el("small", "factor-line", countLabel(evidence.citations.length, "saved source citation")));
+            if (evidence.counts.confirmed) card.append(el("small", "factor-line",
+                `${evidence.counts.confirmed} paths executed by linked tests${evidence.counts.failing ? ` (${evidence.counts.failing} reached by failing tests)` : ""}`));
+            else if (evidence.counts.inferred) card.append(el("small", "factor-line",
+                `${countLabel(evidence.counts.inferred, "path")} with inferred test links; execution not established`));
+        }
         if (item.impact_factors?.length) card.append(el("small", "factor-line", item.impact_factors.join(" · ")));
         card.dataset.itemId = item.id;
         card.classList.toggle("is-selected", state.selected?.id === item.id || state.areaGroup?.id === item.id);
         card.title = [item.title, item.body || item.reason].filter(Boolean).join("\n");
         card.addEventListener("click", () => openReviewItem(item));
         if (container === elements.attention) {
-            const closed = isFindingClosed(item, state.closedFindingKeys);
+            const hidden = isFindingClosed(item, state.closedFindingKeys);
+            const triage = concernTriage(item, state.reviewLedger);
+            const closed = hidden || isConcernSetAside(item, state.reviewLedger);
             const wrapper = el("div", `queue-item${closed ? " is-closed" : ""}`);
             wrapper.dataset.itemId = item.id;
-            const toggle = el("button", "queue-toggle", closed ? "Reopen" : "Close");
+            const layer = layerOf(layeredNavigation(), { path: concernPath(item) });
+            if (layer) {
+                wrapper.dataset.layer = layer.id;
+                const chip = layerMarker(layer, "layer-chip layer-chip-inline");
+                chip.title = layerLabel(layer);
+                heading.prepend(chip);
+            }
+            const toggle = el("button", "queue-toggle", hidden ? "Reopen" : "Close");
             toggle.type = "button";
-            toggle.setAttribute("aria-label", `${closed ? "Reopen" : "Close"} ${item.title || item.name}`);
+            toggle.setAttribute("aria-label", `${hidden ? "Reopen" : "Close"} ${item.title || item.name}`);
             toggle.addEventListener("click", () => toggleFinding(item));
-            if (closed) heading.append(el("span", "closed-label", "Closed"));
-            wrapper.append(card, toggle);
+            if (hidden) heading.append(el("span", "closed-label", "Closed"));
+            else if (triage) heading.append(el("span", "closed-label", reviewStateLabel(triage)));
+            // Set-aside concerns are already closed by their triage; change the triage to reopen them.
+            wrapper.append(card, ...(closed && !hidden ? [] : [toggle]));
+            const impact = el("button", "link-button", "Impact");
+            impact.type = "button";
+            impact.setAttribute("aria-label", `Show impact of ${item.title || item.name}`);
+            impact.addEventListener("click", () => openImpact(item));
+            if (!item.collect_mode) wrapper.append(impact);
+            if (!item.collect_mode) {
+                const ask = el("button", "link-button", "Ask");
+                ask.type = "button";
+                ask.setAttribute("aria-label", `Ask about ${item.title || item.name}`);
+                ask.addEventListener("click", () => discussItem(item).catch(showError));
+                wrapper.append(ask);
+            }
             container.append(wrapper);
         } else {
             container.append(card);
         }
+    }
+    if (container === elements.attention) groupConcernsByLayer(container);
+}
+
+// One priority per concern everywhere (cards, strip, Attention, detail, handoff); cached per review state.
+function concernPriority(finding) {
+    const payload = state.payload;
+    const model = payload?.model;
+    if (!model) return finding.impact_score ?? null;
+    const key = `${payload.review_generation}:${payload.decision_map?.status || ""}:${payload.test_run?.finished_at || ""}:${payload.test_run?.status || ""}:${(payload.generated_observations || []).length}`;
+    if (state.priorityKey !== key) {
+        state.priorityKey = key;
+        state.priorityOf = concernPriorities(buildReviewPlan(model, payload.decision_map, payload.test_run,
+            [...groupFindings(model.attention || []), ...(payload.generated_observations || [])]));
+    }
+    return state.priorityOf(finding);
+}
+
+// Hidden in this browser, or triaged as an accepted risk or false positive.
+const concernClosed = (item) => isFindingClosed(item, state.closedFindingKeys) || isConcernSetAside(item, state.reviewLedger);
+
+function concernPath(item) {
+    const model = state.payload?.model;
+    if (item.path) return item.path;
+    if (state.nodePathModel !== model) {
+        state.nodePathModel = model;
+        state.nodePaths = new Map((model?.nodes || []).map((entry) => [entry.id, entry.path]));
+    }
+    const nodePath = item.node_id && state.nodePaths.get(item.node_id);
+    if (nodePath) return nodePath;
+    const pkg = (model?.package_changes || []).find((entry) => entry.id === (item.package_id || item.id));
+    return pkg && (pkg.declared_current?.[0]?.source || pkg.declared_base?.[0]?.source) || null;
+}
+
+// Concerns read in reading-path layer order, keeping their impact order within each layer.
+function groupConcernsByLayer(container) {
+    const navigation = layeredNavigation();
+    if (!navigation) return;
+    const items = [...container.querySelectorAll(":scope > .queue-item")];
+    const order = new Map(navigation.layers.map((layer, index) => [layer.id, index]));
+    const rank = (item) => item.dataset.layer ? order.get(item.dataset.layer) : Infinity;
+    const sorted = items.map((item, index) => ({ item, index })).sort((a, b) => rank(a.item) - rank(b.item) || a.index - b.index);
+    let current;
+    for (const { item } of sorted) {
+        const layer = item.dataset.layer || "";
+        if (layer !== current) {
+            current = layer;
+            const match = navigation.layers.find((entry) => entry.id === layer);
+            container.append(el("h3", "review-plan-layer", match ? layerLabel(match) : "Outside the reading path"));
+        }
+        container.append(item);
     }
 }
 
@@ -409,32 +1568,174 @@ function toggleFinding(item) {
     }
 }
 
-function loadReviewLedger(model) {
+function loadReviewLedger(model, { force = false } = {}) {
     const key = reviewSnapshotKey(model, state.payload?.review_target);
-    if (state.reviewLedgerStorageKey === key) return;
+    if (state.reviewLedgerStorageKey === key && !force) return;
+    const previous = state.reviewLedgerStorageKey;
     state.reviewLedgerStorageKey = key;
     state.reviewLedgerError = null;
-    try {
-        state.reviewLedger = parseReviewLedger(localStorage.getItem(key));
-    } catch (error) {
-        state.reviewLedger = new Map();
-        state.reviewLedgerError = `Unable to restore review progress: ${error.message}`;
+    if (previous !== key) {
+        try {
+            state.reviewLedger = parseReviewLedger(localStorage.getItem(key));
+            state.progressLegacyCopy = localStorage.getItem(`${key}:unmigrated`) || null;
+        } catch (error) {
+            state.reviewLedger = new Map();
+            state.reviewLedgerError = `Unable to restore browser review progress: ${error.message}`;
+        }
     }
+    state.progressLoading = true;
+    state.progressReady = false;
+    state.progressError = null;
+    renderFileReview();
+    const local = serializeReviewLedger(state.reviewLedger);
+    api("/api/review-progress").then(async (record) => {
+        if (state.reviewLedgerStorageKey !== key) return;
+        if (record.snapshot !== key) throw new Error("Saved progress returned a different source snapshot.");
+        if (!record.revision && state.reviewLedger.size) {
+            record = await api("/api/review-progress", { method: "POST",
+                body: JSON.stringify({ snapshot: key, revision: 0, entries: JSON.parse(local), cursor: record.cursor }) });
+        } else if (record.revision && local !== "{}" && local !== JSON.stringify(record.entries)) {
+            state.progressLegacyCopy = local;
+            try { localStorage.setItem(`${key}:unmigrated`, local); }
+            catch (error) { state.reviewLedgerError = `Browser progress differs from the saved copy; export it before closing: ${error.message}`; }
+        }
+        if (state.reviewLedgerStorageKey !== key) return;
+        state.reviewLedger = parseReviewLedger(JSON.stringify(record.entries));
+        state.progressRevision = record.revision;
+        state.progressDurable = record.durable;
+        state.savedReviewCursor = record.cursor;
+        state.progressReady = true;
+        state.progressLoading = false;
+        render();
+        renderFileReview();
+    }).catch((error) => {
+        if (state.reviewLedgerStorageKey !== key) return;
+        state.progressLoading = false;
+        state.progressError = error.message;
+        renderReviewOverview();
+        renderFileReview();
+    });
 }
 
-function saveReviewLedger() {
+function cacheReviewLedger() {
     try {
         localStorage.setItem(state.reviewLedgerStorageKey, serializeReviewLedger(state.reviewLedger));
         state.reviewLedgerError = null;
     } catch (error) {
-        state.reviewLedgerError = `Unable to save review progress: ${error.message}`;
+        state.reviewLedgerError = `Session progress is saved, but its browser cache could not be updated: ${error.message}`;
         showError(new Error(state.reviewLedgerError));
         return false;
     }
     return true;
 }
 
-function setReviewDisposition(item, disposition, note = "") {
+// A saved cursor may only name an item that belongs to the file it points at; otherwise resuming would mix two places.
+function cursorItemId(item, path) {
+    const id = item?.id;
+    if (!id || (item.path && item.path !== path) || (id.startsWith("file:") && id !== `file:${path}`)) return null;
+    return id;
+}
+
+function currentReviewCursor() {
+    const source = state.source || state.workspaceReturn?.source;
+    if (!source?.path) return state.savedReviewCursor || null;
+    const viewed = viewedSourceLocation() || state.workspaceReturn?.cursor;
+    return { path: source.path, line: viewed?.line || Number(source.start_line) || 1,
+        side: viewed?.side || source.focus_side || (source.current === null ? "base" : "current"),
+        tab: state.source ? state.sourceTab : state.workspaceReturn.tab,
+        item_id: cursorItemId(source.reviewItem || state.selected || state.workspaceReturn?.selected, source.path), group: state.activeReviewGroup || null };
+}
+
+// Where the reader actually is: the source they just left (not yet autosaved) before the last saved position.
+function liveReviewCursor() {
+    const saved = state.workspaceReturn;
+    if (saved?.generation !== state.payload?.review_generation || !saved.source?.path) return state.savedReviewCursor || null;
+    const source = saved.source;
+    return { path: source.path, line: saved.cursor?.line || Number(source.start_line) || 1,
+        side: saved.cursor?.side || source.focus_side || (source.current === null ? "base" : "current"),
+        tab: saved.tab, item_id: cursorItemId(saved.selected, source.path), group: saved.group || null, live: true };
+}
+
+// Leaving Review saves the reading point immediately so labels, Finish and a reload all agree.
+function flushReviewCursor() {
+    clearTimeout(state.cursorSaveTimer);
+    const cursor = liveReviewCursor();
+    if (!cursor?.live || !state.progressReady || state.progressSaving) return;
+    const { live, ...stored } = cursor;
+    if (JSON.stringify(stored) === JSON.stringify(state.savedReviewCursor)) return;
+    persistReviewEntries(new Map(state.reviewLedger), stored, { quiet: true }).then((saved) => { if (saved) renderReviewOverview(); });
+}
+
+// Only decision saves show "Saving…" and lock the footer; reading-position saves happen silently in the background.
+function savingDecision() {
+    return state.progressSaving && !state.progressSavingBackground;
+}
+
+async function persistReviewEntries(entries, cursor = currentReviewCursor(), { quiet = false, background = false } = {}) {
+    // A background reading-position save never blocks a decision: wait for it to finish, then save the decision.
+    if (!background && state.progressSaving && state.progressSavingBackground) await state.progressSavePromise?.catch(() => {});
+    if (!state.progressReady || state.progressSaving) {
+        if (background) return false;
+        showError(new Error(state.progressSaving ? "Wait for the current review decision to save." : "Reload saved progress before recording a decision."));
+        return false;
+    }
+    const key = state.reviewLedgerStorageKey;
+    state.progressSaving = true;
+    state.progressSavingBackground = background;
+    let settle;
+    state.progressSavePromise = new Promise((resolve) => { settle = resolve; });
+    state.progressError = null;
+    if (!background) renderFileReview();
+    const save = (revision, values) => api("/api/review-progress", { method: "POST",
+        body: JSON.stringify({ snapshot: key, revision, entries: Object.fromEntries(values), cursor }) });
+    try {
+        let record;
+        try { record = await save(state.progressRevision, entries); }
+        catch (error) {
+            if (error.status !== 409) throw error;
+            // Another tab saved (often only a reading position). Rebase this change if it touched none of the same records.
+            const latest = await api("/api/review-progress");
+            if (latest.snapshot !== key) throw error;
+            const base = state.reviewLedger;
+            const changed = new Set([...entries.keys(), ...base.keys()].filter((id) => JSON.stringify(entries.get(id)) !== JSON.stringify(base.get(id))));
+            if ([...changed].some((id) => JSON.stringify(latest.entries[id]) !== JSON.stringify(base.get(id)))) throw error;
+            const merged = new Map(Object.entries(latest.entries));
+            for (const id of changed) entries.has(id) ? merged.set(id, entries.get(id)) : merged.delete(id);
+            record = await save(latest.revision, merged);
+        }
+        if (state.reviewLedgerStorageKey !== key) return false;
+        state.reviewLedger = parseReviewLedger(JSON.stringify(record.entries));
+        state.progressRevision = record.revision;
+        state.progressDurable = record.durable;
+        state.savedReviewCursor = record.cursor;
+        if (record.github_viewed) {
+            state.githubViewed = record.github_viewed;
+            if (state.prReview?.viewed && !record.github_viewed.message) {
+                for (const [id, entry] of Object.entries(record.entries)) {
+                    if (id.startsWith("review-file:")) state.prReview.viewed[id.slice(12)] = entry.disposition === "reviewed";
+                }
+            }
+        } else state.githubViewed = null;
+        cacheReviewLedger();
+        if (!quiet) render();
+        return true;
+    } catch (error) {
+        if (state.reviewLedgerStorageKey === key) {
+            state.progressError = error.message;
+            if (!quiet) showError(error);
+        }
+        return false;
+    } finally {
+        if (state.reviewLedgerStorageKey === key) {
+            state.progressSaving = false;
+            state.progressSavingBackground = false;
+        }
+        settle();
+        renderFileReview();
+    }
+}
+
+async function setReviewDisposition(item, disposition, note = "") {
     const record = {
         disposition,
         note: note.trim(),
@@ -445,19 +1746,1069 @@ function setReviewDisposition(item, disposition, note = "") {
     const entries = new Map(state.reviewLedger);
     if (disposition === "pending" && !record.note) entries.delete(item.id);
     else entries.set(item.id, record);
-    state.reviewLedger = entries;
-    if (!saveReviewLedger()) return;
-    render();
-    if (state.source) renderSourceRisk();
+    if (await persistReviewEntries(entries) && state.source) renderSourceRisk();
 }
+
+elements.review_progress_retry.addEventListener("click", () => loadReviewLedger(state.payload.model, { force: true }));
+elements.file_review_retry.addEventListener("click", () => loadReviewLedger(state.payload.model, { force: true }));
+elements.review_progress_backup.addEventListener("click", () => {
+    const blob = new Blob([state.progressLegacyCopy || "{}"], { type: "application/json" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = "previous-browser-review-progress.json";
+    link.click();
+    URL.revokeObjectURL(link.href);
+});
+
+function fileReviewQueue() {
+    const cached = state.sectionData && !state.payload?.loading ? layeredNavigation() : null;
+    return reviewSequence(cached || workspaceNavigation(state.payload?.model, state.sectionData), state.navigationMode);
+}
+
+// Review groups load asynchronously; choosing a file before they arrive would treat every file as supporting.
+async function readySectionData() {
+    if (ensureSectionData()) return;
+    await state.sectionPromise;
+}
+
+async function nextFileFromRail(current = null) {
+    await readySectionData();
+    return nextFileReview(fileReviewQueue(), state.reviewLedger, current);
+}
+
+function uniqueReviewFiles() {
+    return [...new Map(fileReviewQueue().map((entry) => [entry.path, entry])).values()];
+}
+
+async function openFileReview(entry) {
+    if (!entry) { openFinishReview(); return; }
+    const navigation = workspaceNavigation(state.payload.model, state.sectionData);
+    const group = navigation.groups.find((item) => item.id === entry.group)
+        || navigation.groups.find((item) => item.files.some((file) => file.path === entry.path));
+    const priority = !group?.section && overviewPlan().find((item) => item.path === entry.path);
+    if (priority) { openReviewPlanItem(priority); return; }
+    await openWorkspaceFile(entry.file || entry, group);
+}
+
+async function openOverviewDestination(destination) {
+    if (destination?.resume?.live && state.workspaceReturn?.source?.path === destination.path) await returnWorkspaceSource({ code: true });
+    else if (destination?.resume) await resumeReviewCursor(destination.resume);
+    else await openFileReview(destination?.entry || null);
+}
+
+async function resumeReviewCursor(cursor) {
+    const model = state.payload?.model;
+    if (!cursor || !Object.hasOwn(model.source_files || {}, cursor.path)) throw new Error("The saved reading point is unavailable in this snapshot.");
+    let item = [...model.nodes, ...model.edges || [], ...model.package_changes || [], ...model.package_dependencies || [],
+        ...model.attention || [], ...(state.payload.generated_observations || [])].find((item) => item.id === cursor.item_id);
+    if (!item && cursor.item_id?.startsWith("section:")) {
+        const data = await api("/api/review-sections");
+        if (state.payload.model !== model) throw new Error("The review changed while restoring the saved group.");
+        const section = data.sections.find((section) => section.id === cursor.item_id);
+        if (section) item = { id: section.id, kind: "section", title: section.title, path: cursor.path };
+    }
+    if (!item && model.evidence?.[cursor.item_id]) item = { id: cursor.item_id, kind: "evidence", path: cursor.path };
+    // An unknown or mismatched item never blocks resuming: the saved path and line are the reading point.
+    if (item?.path && item.path !== cursor.path) item = null;
+    state.selected = item || { id: `file:${cursor.path}`, kind: "file", path: cursor.path, name: cursor.path };
+    state.reviewPage = "review";
+    state.exploring = false;
+    state.mode = "walkthrough";
+    state.activeReviewGroup = cursor.group;
+    const loaded = await openSourceReference({ path: cursor.path, lines: [cursor.line], side: cursor.side },
+        { focus: true, tab: cursor.tab, nav: "reset" });
+    const generated = model.changes.find((file) => file.path === cursor.path)?.generated;
+    if (loaded && !generated && !["section", "package"].includes(state.selected?.kind)) ensureAnnotation(state.selected);
+}
+
+// Where this file sits and how big it is: "+56 −8 · file 2 of 3 in 2. Apply verified export corrections".
+function renderSourcePosition(path) {
+    const change = state.payload?.model?.changes?.find((item) => item.path === path && item.status !== "unchanged");
+    const navigation = change && layeredNavigation();
+    const layer = navigation && layerOf(navigation, { path });
+    const parts = [];
+    if (change) parts.push(`+${(change.lines_added || 0).toLocaleString()} −${(change.lines_removed || 0).toLocaleString()}`);
+    if (layer) {
+        const groups = new Set(layer.groups.map((group) => group.id));
+        const files = [...new Set(reviewSequence(navigation).filter((entry) => groups.has(entry.group)).map((entry) => entry.path))];
+        const index = files.indexOf(path);
+        if (index >= 0) parts.push(`file ${index + 1} of ${files.length} in ${layerLabel(layer)}`);
+    }
+    if (!change) parts.push("related source, outside the change");
+    elements.source_position.textContent = parts.join(" · ");
+    elements.source_position.title = parts.join(" · ");
+}
+
+// The file "Mark … & next" will open, so the button can name its target.
+// The next reading-path entry after the open file, assuming the open file is marked as decided.
+function nextReviewEntry() {
+    const source = state.source;
+    if (!source) return null;
+    const disposition = elements.file_review_disposition.value === "pending" ? "reviewed" : elements.file_review_disposition.value;
+    const entries = new Map(state.reviewLedger);
+    entries.set(fileReviewId(source.path), { disposition, path: source.path });
+    const next = nextFileReview(fileReviewQueue(), entries,
+        { path: source.path, group: state.navigationMode === "files" ? null : state.activeReviewGroup || null });
+    return next && next.path !== source.path ? next : null;
+}
+
+function nextFileLabel() {
+    return nextReviewEntry()?.path || null;
+}
+
+// Which explanation Agent Review shows when a reading-path entry opens: its first changed symbol, a priority's callable
+// or finding, or else the whole file. Mirrors openFileReview and openWorkspaceFile.
+function annotationIdForEntry(entry) {
+    const model = state.payload?.model;
+    // Which item opens depends on the reading-path groups; guessing before they load would prefetch the wrong one.
+    if (!model || !entry?.path || !state.sectionData) return null;
+    const file = entry.file || model.changes.find((change) => change.path === entry.path);
+    if (!file || file.generated) return null;
+    // Resuming a saved reading point reopens the exact item that was selected.
+    if (entry.resume) {
+        const id = entry.resume.item_id;
+        if (id?.startsWith("section:") || id?.startsWith("package:")) return null;
+        const known = id && [...model.nodes, ...(model.edges || []), ...(model.attention || []),
+            ...(state.payload.generated_observations || [])]
+            .some((item) => item.id === id && (!item.path || item.path === entry.path));
+        if (id && model.evidence?.[id]) return id;
+        return known ? id : `file:${entry.path}`;
+    }
+    const navigation = workspaceNavigation(model, state.sectionData);
+    const group = navigation.groups.find((item) => item.id === entry.group)
+        || navigation.groups.find((item) => item.files.some((candidate) => candidate.path === entry.path));
+    if (!group?.section) {
+        const priority = overviewPlan().find((item) => item.path === entry.path);
+        if (priority) return priority.kind === "package" ? null
+            : priority.kind === "callable" && priority.preferred ? priority.callable.id : (priority.finding || priority.node)?.id || null;
+    }
+    const range = group?.section?.ranges.find((item) => item.path === entry.path && item.side !== "base")
+        || group?.section?.ranges.find((item) => item.path === entry.path);
+    const node = range?.symbol_id && model.nodes.find((item) => item.id === range.symbol_id);
+    return node ? node.id : `file:${entry.path}`;
+}
+
+function requestAnnotation(item) {
+    const generation = state.payload.review_generation;
+    const key = `${generation}:${item.id}`;
+    const cached = state.payload.annotations?.[item.id];
+    if (cached) return Promise.resolve(cached);
+    if (state.annotationRequests.has(key)) return state.annotationRequests.get(key);
+    const promise = api("/api/annotation", { method: "POST",
+        body: JSON.stringify({ id: item.id, evidence_ids: item.evidence_ids || [] }) })
+        .then(({ annotation }) => {
+            if (state.payload?.review_generation === generation) {
+                state.payload.annotations ||= {};
+                state.payload.annotations[item.id] = annotation;
+            }
+            return annotation;
+        }).finally(() => {
+            if (state.annotationRequests.get(key) === promise) state.annotationRequests.delete(key);
+        });
+    state.annotationRequests.set(key, promise);
+    return promise;
+}
+
+function renderPrefetchStatus() {
+    const status = state.prefetchStatus;
+    for (const panel of [elements.overview_prefetch, elements.workspace_prefetch]) {
+        panel.replaceChildren();
+        panel.classList.toggle("hidden", !status);
+        if (!status) continue;
+        if (status.error) panel.append(el("p", "muted", `Could not prepare ${status.path.split("/").at(-1)}. Open the file to retry. ${status.error}`));
+        else panel.append(activityPlaceholder(`Preparing next explanation: ${status.path.split("/").at(-1)}`, 1));
+    }
+}
+
+// Share the request with a click that arrives before prefetch finishes; retain the result even after navigating away.
+function prefetchAnnotation(entry) {
+    const id = annotationIdForEntry(entry);
+    const payload = state.payload;
+    if (!id || payload?.annotations?.[id] || payload?.loading) return;
+    state.prefetchedAnnotations ||= new Set();
+    const key = `${payload.review_generation}:${id}`;
+    if (state.prefetchedAnnotations.has(key)) return;
+    state.prefetchedAnnotations.add(key);
+    const status = { id, path: entry.path };
+    state.prefetchStatus = status;
+    renderPrefetchStatus();
+    requestAnnotation({ id }).then(() => {
+        if (state.prefetchStatus === status) state.prefetchStatus = null;
+    }, (error) => {
+        if (state.prefetchStatus === status) status.error = error.message;
+    }).finally(() => {
+        if (state.payload?.review_generation === payload.review_generation) renderPrefetchStatus();
+    });
+}
+
+// Prefetch the next item shortly after a file settles, so the open file's own explanation goes first and skimming
+// through files quickly does not start a generation for each one.
+function schedulePrefetchNext() {
+    clearTimeout(state.prefetchTimer);
+    const path = state.source?.path;
+    if (!path || state.reviewPage !== "review") return;
+    state.prefetchTimer = setTimeout(() => {
+        if (state.source?.path !== path || state.reviewPage !== "review") return;
+        // Still opening: check again once the file has settled.
+        if (state.pendingSource) { schedulePrefetchNext(); return; }
+        prefetchAnnotation(nextReviewEntry());
+    }, 1200);
+}
+
+function renderFileReview() {
+    const source = state.source;
+    const changed = source && state.payload?.model?.changes?.some((file) => file.path === source.path && file.status !== "unchanged");
+    elements.file_review_form.classList.toggle("hidden", !changed);
+    if (!changed) return;
+    const key = `${state.reviewLedgerStorageKey}:${source.path}`;
+    const record = state.fileReviewDrafts.get(key) || state.reviewLedger.get(fileReviewId(source.path)) || { disposition: "pending", note: "" };
+    elements.file_review_label.textContent = `Decision · ${source.path.split("/").at(-1)}`;
+    elements.file_review_label.title = `Whole-file review · ${source.path}`;
+    if (elements.file_review_form.dataset.key !== key || !state.fileReviewDrafts.has(key)) {
+        elements.file_review_form.dataset.key = key;
+        elements.file_review_disposition.value = record.disposition;
+        elements.file_review_note.value = record.note || "";
+    }
+    // A decision can only apply to a file whose source has finished loading.
+    const disabled = !state.progressReady || savingDecision() || Boolean(state.pendingSource) || Boolean(state.advancing);
+    for (const element of [elements.file_review_disposition, elements.file_review_note, elements.file_review_save, elements.file_review_open_next, elements.file_review_next]) element.disabled = Boolean(disabled);
+    const verb = elements.file_review_disposition.value === "pending" ? "Mark reviewed"
+        : elements.file_review_disposition.value === "follow-up" ? "Save follow-up" : "Save";
+    const target = state.pendingSource || !state.sectionData ? undefined : nextFileLabel();
+    elements.file_review_open_next.textContent = target === null ? "Review summary" : "Next file";
+    elements.file_review_open_next.title = `${target ? `Opens ${target}` : target === null ? "Opens the review summary" : "Opens the next file"} without changing your review decision. Unsaved edits stay in this view's draft.`;
+    elements.file_review_next.textContent = target === undefined ? `${verb} & next`
+        : target ? `${verb} & next: ${target.split("/").at(-1)}` : `${verb} & finish`;
+    elements.file_review_next.title = target ? `Then opens ${target} (M)` : target === null ? "Then opens the review summary (M)" : "Save and open the next file (M)";
+    elements.file_review_status.textContent = state.progressError ? `Not saved: ${state.progressError}`
+        : state.progressLoading ? "Restoring session progress…" : savingDecision() ? "Saving…"
+            : state.fileReviewDrafts.has(key) ? "Unsaved whole-file decision"
+            : state.progressDurable ? "Saved" : "Memory-only progress";
+    // On a pull request, report whether GitHub's "Viewed" checkbox followed the last decision on this file.
+    const viewedSync = state.githubViewed;
+    if (viewedSync && (viewedSync.paths || []).includes(state.source?.path) && !state.progressError && !savingDecision() && !state.fileReviewDrafts.has(key)) {
+        elements.file_review_status.textContent = viewedSync.message ? `Saved · ${viewedSync.message}` : "Saved · Viewed on GitHub updated";
+    }
+    elements.file_review_status.title = state.progressDurable ? "Progress is saved in this session workspace" : "Progress is memory-only until this provider closes";
+    elements.file_review_status.dataset.quiet = String(!state.progressError && !state.progressLoading && !savingDecision()
+        && !state.fileReviewDrafts.has(key) && Boolean(state.progressDurable));
+    elements.file_review_retry.classList.toggle("hidden", !state.progressError);
+}
+
+function keepFileDraft() {
+    if (!state.source) return;
+    state.fileReviewDrafts.set(`${state.reviewLedgerStorageKey}:${state.source.path}`, {
+        disposition: elements.file_review_disposition.value, note: elements.file_review_note.value,
+    });
+    renderFileReview();
+}
+elements.file_review_disposition.addEventListener("change", keepFileDraft);
+elements.file_review_note.addEventListener("input", keepFileDraft);
+async function openNextFile() {
+    const source = state.source;
+    if (!source || elements.file_review_open_next.disabled || state.pendingSource || state.advancing) return;
+    state.advancing = true;
+    renderFileReview();
+    try {
+        await readySectionData();
+        if (state.source !== source) return;
+        await openFileReview(nextReviewEntry());
+    } finally {
+        setTimeout(() => { state.advancing = false; renderFileReview(); }, 350);
+    }
+}
+elements.file_review_open_next.addEventListener("click", () => openNextFile().catch(showError));
+async function saveCurrentFile(advance) {
+    const source = state.source;
+    if (!source || state.pendingSource || state.advancing) return;
+    const path = source.path;
+    const key = `${state.reviewLedgerStorageKey}:${path}`;
+    const disposition = advance && elements.file_review_disposition.value === "pending" ? "reviewed" : elements.file_review_disposition.value;
+    const entries = new Map(state.reviewLedger);
+    entries.set(fileReviewId(path), { disposition, note: elements.file_review_note.value.trim(), path,
+        line: currentReviewCursor()?.line || 1, updated_at: new Date().toISOString() });
+    // One Mark & next at a time: the next file must have opened and stayed on screen briefly before it can be marked.
+    if (advance) state.advancing = true;
+    try {
+        if (!await persistReviewEntries(entries)) return;
+        state.fileReviewDrafts.delete(key);
+        elements.file_review_form.dataset.key = "";
+        renderFileReview();
+        if (advance) {
+            const next = await nextFileFromRail(
+                { path, group: state.navigationMode === "files" ? null : state.activeReviewGroup || null });
+            if (!next || (next.path === path && disposition !== "pending")) openFinishReview();
+            else await openFileReview(next);
+        }
+    } finally {
+        if (advance) setTimeout(() => { state.advancing = false; renderFileReview(); }, 350);
+    }
+}
+elements.file_review_save.addEventListener("click", () => saveCurrentFile(false).catch(showError));
+elements.file_review_form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveCurrentFile(true).catch(showError);
+});
+elements.group_review_cancel.addEventListener("click", () => elements.group_review_dialog.close());
+elements.group_review_close.addEventListener("click", () => elements.group_review_dialog.close());
+elements.group_review_confirm.addEventListener("click", async () => {
+    const group = state.bulkReviewGroup;
+    if (!group) return;
+    elements.group_review_confirm.disabled = true;
+    const entries = new Map(state.reviewLedger);
+    const updated = new Date().toISOString();
+    for (const file of group.files) {
+        const previous = entries.get(fileReviewId(file.path));
+        entries.set(fileReviewId(file.path), { disposition: "reviewed", path: file.path,
+            note: previous?.note || "", line: previous?.line || 1, updated_at: updated });
+    }
+    if (await persistReviewEntries(entries)) elements.group_review_dialog.close();
+    else {
+        elements.group_review_confirm.disabled = false;
+        elements.group_review_error.textContent = state.progressError || "Unable to save these file decisions.";
+        elements.group_review_error.classList.remove("hidden");
+    }
+});
+
+function openFinishReview() {
+    if (state.reviewPage !== "finish") rememberViewReturn();
+    state.selectionEpoch++;
+    sourceRenderVersion++;
+    rememberWorkspaceSource();
+    setSourceFocus(false);
+    state.reviewPage = "finish";
+    state.navigationOpen = false;
+    elements.source_panel.classList.add("hidden");
+    render();
+    flushReviewCursor();
+    elements.review_finish.focus({ preventScroll: true });
+}
+
+function renderFinishReview() {
+    const model = state.payload?.model;
+    if (!model || state.reviewPage !== "finish") return;
+    const progress = fileReviewProgress(model, state.reviewLedger);
+    const panel = elements.review_finish;
+    const heading = el("div", "view-heading");
+    const back = el("button", "view-back", "← Back");
+    back.type = "button";
+    back.addEventListener("click", () => returnPreviousView());
+    const close = el("button", "view-close", "Close");
+    close.type = "button";
+    close.setAttribute("aria-label", "Close review summary");
+    close.addEventListener("click", () => returnPreviousView());
+    heading.append(back, el("h2", "", progress.pending || progress.followUp ? "Review has remaining work" : "Changed files marked reviewed"), close);
+    panel.replaceChildren(el("p", "eyebrow", "HUMAN REVIEW SUMMARY"), heading,
+        el("p", "", `${progress.reviewed} of ${countLabel(progress.total, "changed file")} reviewed · ${progress.pending} not reviewed · ${progress.followUp} need follow-up`),
+        el("p", "muted", "Human review decisions do not prove correctness, resolve concerns, complete AI analysis or establish test coverage."));
+    const navigation = layeredNavigation();
+    const next = overviewDestination();
+    if (next) {
+        const layer = layerOf(navigation, next);
+        const button = el("button", "review-next", `Continue at ${layer ? `${layerLabel(layer)} › ` : ""}${next.path.split("/").at(-1)}${next.line ? `:${next.line}` : ""}`);
+        button.type = "button";
+        button.title = `Opens ${next.path}`;
+        button.addEventListener("click", () => openOverviewDestination(next).catch(showError));
+        panel.append(button);
+    }
+    if (navigation?.layers.length) {
+        const layers = el("ol", "overview-layers finish-layers");
+        layers.setAttribute("aria-label", "Progress by layer");
+        for (const layer of navigation.layers) {
+            const progress = layerProgress(layer);
+            const row = el("button", `overview-layer${layer.supporting ? " is-supporting" : ""}`);
+            row.type = "button";
+            const name = layerHeading(layer, { path: false });
+            const progressCell = el("span", "overview-layer-progress", `${progress.reviewed}/${progress.total} reviewed`);
+            const tests = layerTestChip(layer);
+            if (tests) progressCell.append(tests);
+            row.append(layerMarker(layer, "overview-layer-number"), name, progressCell);
+            row.addEventListener("click", () => openLayer(navigation, layer));
+            const item = el("li", "");
+            item.append(row);
+            layers.append(item);
+        }
+        panel.append(layers);
+    }
+    const legacy = [...state.reviewLedger].filter(([id, entry]) => !id.startsWith("review-file:") && entry.disposition !== "pending");
+    const triagedFollowUp = legacy.filter(([, entry]) => entry.disposition === "follow-up").length;
+    if (legacy.length) panel.append(el("p", "muted", `${countLabel(legacy.length, "concern")} triaged${
+        triagedFollowUp ? ` (${triagedFollowUp} ${plural(triagedFollowUp, "needs", "need")} follow-up)` : ""}. Triage explains a concern but does not mark files reviewed.`));
+    const findings = groupFindings(model.attention || []);
+    const activeCount = findings.filter((item) => !concernClosed(item)).length;
+    const setAside = findings.filter((item) => !isFindingClosed(item, state.closedFindingKeys) && isConcernSetAside(item, state.reviewLedger)).length;
+    panel.append(el("p", "", `${countLabel(activeCount, "active concern")} ${plural(activeCount, "remains", "remain")}${
+        setAside ? ` · ${countLabel(setAside, "concern")} set aside as accepted risk or false positive` : ""}.`));
+    const tests = state.payload.test_run;
+    const distinctTests = new Set((tests?.tests || []).map((test) => baseTestId(test.id))).size;
+    const caseNote = (tests?.tests || []).length > distinctTests ? ` (results across ${countLabel(distinctTests, "linked test")}; each parametrized case is a result)` : "";
+    panel.append(el("p", "muted", tests?.tests?.length && ["complete", "running"].includes(tests.status)
+        ? `Linked-test results so far: ${tests.counts?.passed || 0} passed, ${(tests.counts?.failed || 0) + (tests.counts?.error || 0)} failed${
+            tests.counts?.skipped ? `, ${tests.counts.skipped} skipped` : ""}${caseNote}${
+            tests.status === "running" ? "; a run is in progress" : ""}. Each layer's outcome is shown beside it. This is separate from human review.`
+        : tests?.status === "complete"
+            ? `Linked-test run completed: ${tests.counts?.passed || 0} passed, ${tests.counts?.failed || 0} failed. This is separate from human review.`
+            : "No completed linked-test run is recorded for this view. Coverage and AI analysis retain their own evidence limits."));
+    const list = el("div", "finish-files");
+    const fileButton = (file, group) => {
+        const record = state.reviewLedger.get(fileReviewId(file.path));
+        const button = el("button", "workspace-file", `${reviewStateLabel(record?.disposition || "pending")} · ${file.path}${record?.note ? ` — ${record.note}` : ""}`);
+        button.type = "button";
+        button.addEventListener("click", () => openFileReview(group ? { path: file.path, group: group.id, file } : file).catch(showError));
+        return button;
+    };
+    if (navigation) {
+        for (const layer of navigation.layers) {
+            list.append(el("h4", "finish-layer-heading", layerLabel(layer)));
+            for (const group of layer.groups) for (const file of group.files) list.append(fileButton(file, group));
+        }
+    } else for (const file of uniqueReviewFiles()) list.append(fileButton(file, null));
+    const details = el("details", "");
+    details.append(el("summary", "", "All file decisions"), list);
+    panel.append(details);
+    const pr = state.prReview;
+    const drafted = pr?.drafts?.comments?.length || 0;
+    if (pr?.available) {
+        const files = (model.changes || []).filter((file) => file.status !== "unchanged");
+        const viewed = files.filter((file) => pr.viewed?.[file.path]).length;
+        panel.append(el("p", "", `Pull request: ${countLabel(drafted, "draft line comment")} ready to post · ${viewed} of ${countLabel(files.length, "file")} marked Viewed on GitHub${
+            pr.threads?.length ? ` · ${countLabel(pr.threads.filter((thread) => !thread.reply_to).length, "existing thread")}` : ""}.`));
+        if (pr.github_error) panel.append(el("p", "error", pr.github_error));
+        if (pr.head_matches === false) panel.append(el("p", "error", `The pull request has newer commits (${String(pr.head || "").slice(0, 7)}) than this review. Re-open it in Agent Review before posting; nothing can be posted from this snapshot.`));
+    } else if (drafted) panel.append(el("p", "muted", `${countLabel(drafted, "line comment")} drafted; they are included in the handoff summary.`));
+    const handoff = el("button", next ? "review-next review-secondary" : "review-next", pr?.available ? "Review & submit to pull request" : "Preview / export handoff");
+    handoff.type = "button";
+    handoff.disabled = !state.progressReady || savingDecision();
+    handoff.addEventListener("click", () => openReviewHandoff());
+    panel.append(handoff);
+}
+
+function handoffError(error, panel = elements.handoff_error) {
+    panel.textContent = error.message;
+    panel.classList.remove("hidden");
+    panel.tabIndex = -1;
+    panel.focus({ preventScroll: true });
+    panel.scrollIntoView({ block: "nearest" });
+}
+
+async function openReviewHandoff() {
+    const epoch = state.handoffEpoch = (state.handoffEpoch || 0) + 1;
+    state.handoff = null;
+    state.handoffImport = null;
+    elements.handoff_error.classList.add("hidden");
+    elements.handoff_import_error.classList.add("hidden");
+    elements.handoff_provider_error.classList.add("hidden");
+    elements.handoff_provider_status.textContent = "";
+    elements.handoff_status.textContent = "Preparing the saved-snapshot preview…";
+    elements.handoff_markdown.value = "";
+    elements.handoff_state_preview.textContent = "";
+    elements.handoff_import_file.value = "";
+    elements.handoff_import_preview.textContent = "";
+    elements.handoff_confirm.checked = false;
+    for (const control of [elements.handoff_confirm, elements.handoff_submit, elements.handoff_import_confirm,
+        elements.handoff_markdown_save, elements.handoff_state_save]) control.disabled = true;
+    if (!elements.review_handoff.open) elements.review_handoff.showModal();
+    try {
+        clearTimeout(state.cursorSaveTimer);
+        if (state.source && JSON.stringify(currentReviewCursor()) !== JSON.stringify(state.savedReviewCursor)) {
+            if (!await persistReviewEntries(new Map(state.reviewLedger), currentReviewCursor(), { quiet: true })) {
+                throw new Error(state.progressError || "Save the current reading point before exporting.");
+            }
+        }
+        const preview = await api("/api/review-handoff/preview", { method: "POST", body: "{}" });
+        if (epoch !== state.handoffEpoch || !elements.review_handoff.open) return;
+        state.handoff = preview;
+        elements.handoff_markdown.value = preview.markdown;
+        elements.handoff_markdown.setSelectionRange(0, 0);
+        elements.handoff_markdown.scrollTop = 0;
+        elements.handoff_state_preview.textContent = JSON.stringify(preview.artifact, null, 2);
+        elements.handoff_status.textContent = `Saved ${preview.artifact.repository} · ${preview.artifact.target.mode} · Head ${preview.artifact.target.head}. ${
+            preview.provider.pending ? "A previous provider submission is still awaiting a receipt; a second submission is disabled." : "This preview has not submitted a review."}`;
+        elements.handoff_markdown_save.disabled = false;
+        elements.handoff_state_save.disabled = false;
+        elements.handoff_provider.replaceChildren();
+        // Only a GitHub pull request can receive a review; other targets export locally.
+        elements.handoff_provider_section.classList.toggle("hidden", !preview.provider.url && !preview.provider.pending);
+        if (preview.provider.url) {
+            const link = el("a", "", preview.provider.url);
+            link.href = preview.provider.url;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            elements.handoff_provider.append("Destination: ", link, ` · Commit ${String(preview.provider.commit || "").slice(0, 12)} · ${
+                countLabel(preview.provider.comments || 0, "line comment")} ${preview.provider.available ? "will be posted with this summary. Uses the gh CLI's existing authorization." : "drafted."}`);
+        }
+        elements.handoff_summary.disabled = !preview.provider.available;
+        elements.handoff_verdict.disabled = !preview.provider.available;
+        // GitHub does not allow approving or requesting changes on your own pull request.
+        for (const input of elements.handoff_verdict.querySelectorAll("input")) {
+            const blocked = input.value !== "COMMENT" && preview.provider.own;
+            input.disabled = blocked;
+            input.closest("label").title = blocked ? "GitHub does not allow approving or requesting changes on your own pull request." : "";
+            if (blocked && input.checked) elements.handoff_verdict.querySelector("input[value='COMMENT']").checked = true;
+        }
+        renderHandoffConsent();
+        elements.handoff_provider_status.textContent = preview.provider.available
+            ? `No review has been sent from this preview.${preview.provider.own ? " This is your own pull request, so only Comment is available." : ""}` : preview.provider.reason;
+        elements.handoff_confirm.disabled = !preview.provider.available;
+    } catch (error) {
+        if (epoch === state.handoffEpoch && elements.review_handoff.open) {
+            elements.handoff_status.textContent = "Preview not prepared. No export or submission occurred.";
+            handoffError(error);
+        }
+    }
+}
+elements.handoff_close.addEventListener("click", () => elements.review_handoff.close());
+elements.handoff_refresh.addEventListener("click", () => openReviewHandoff());
+elements.review_handoff.addEventListener("close", () => { state.handoffEpoch++; });
+function downloadHandoff(value, type, name) {
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(new Blob([value], { type }));
+    link.download = name;
+    link.click();
+    URL.revokeObjectURL(link.href);
+}
+elements.handoff_markdown_save.addEventListener("click", () => {
+    if (!state.handoff) { handoffError(new Error("Prepare a handoff preview first.")); return; }
+    downloadHandoff(state.handoff.markdown, "text/markdown", "agent-review-summary.md");
+});
+elements.handoff_state_save.addEventListener("click", () => {
+    if (!state.handoff) { handoffError(new Error("Prepare a handoff preview first.")); return; }
+    downloadHandoff(JSON.stringify(state.handoff.artifact, null, 2), "application/json", "agent-review-state.json");
+});
+elements.handoff_import_file.addEventListener("change", async () => {
+    elements.handoff_error.classList.add("hidden");
+    elements.handoff_import_error.classList.add("hidden");
+    elements.handoff_import_preview.textContent = "Checking selected decision state…";
+    elements.handoff_import_confirm.disabled = true;
+    state.handoffImport = null;
+    const sequence = state.handoffImportEpoch = (state.handoffImportEpoch || 0) + 1;
+    const file = elements.handoff_import_file.files[0];
+    if (!file) { elements.handoff_import_preview.textContent = "No import file selected."; return; }
+    const epoch = state.handoffEpoch;
+    try {
+        if (file.size > 1024 * 1024) throw new Error("Choose an Agent Review state JSON up to 1 MiB.");
+        const artifact = JSON.parse(await file.text());
+        const current = await api("/api/review-progress");
+        const preview = await api("/api/review-handoff/import", { method: "POST",
+            body: JSON.stringify({ artifact, revision: current.revision, confirm: false }) });
+        if (epoch !== state.handoffEpoch || sequence !== state.handoffImportEpoch || !elements.review_handoff.open) return;
+        state.handoffImport = { artifact, revision: preview.revision };
+        elements.handoff_import_preview.textContent = `${preview.repository}: ${countLabel(preview.records, "record")} · ${
+            preview.changes ? `${countLabel(preview.changes, "decision")} would change` : "nothing would change"} · ${preview.message}`;
+        elements.handoff_import_confirm.disabled = !preview.changes;
+    } catch (error) {
+        if (epoch === state.handoffEpoch && sequence === state.handoffImportEpoch && elements.review_handoff.open) {
+            elements.handoff_import_preview.textContent = "Import not ready. Nothing was imported.";
+            handoffError(error, elements.handoff_import_error);
+        }
+    }
+});
+elements.handoff_import_confirm.addEventListener("click", async () => {
+    elements.handoff_import_confirm.disabled = true;
+    elements.handoff_error.classList.add("hidden");
+    elements.handoff_import_error.classList.add("hidden");
+    try {
+        if (!state.handoffImport) throw new Error("Preview an exact matching state file before confirming import.");
+        const result = await api("/api/review-handoff/import", { method: "POST",
+            body: JSON.stringify({ ...state.handoffImport, confirm: true }) });
+        state.handoffImport = null;
+        if (result.unchanged) {
+            elements.handoff_import_preview.textContent = "No decisions changed; nothing was saved.";
+            return;
+        }
+        elements.handoff_import_preview.textContent = `${countLabel(result.changes || 0, "decision")} imported and saved in this session workspace.`;
+        loadReviewLedger(state.payload.model, { force: true });
+        state.handoff = null;
+        elements.handoff_markdown_save.disabled = true;
+        elements.handoff_state_save.disabled = true;
+        elements.handoff_submit.disabled = true;
+        elements.handoff_confirm.disabled = true;
+        elements.handoff_confirm.checked = false;
+        elements.handoff_status.textContent = "Progress changed. Refresh the handoff preview before exporting or submitting.";
+    } catch (error) {
+        elements.handoff_import_preview.textContent = "Import failed. No decisions were overwritten.";
+        handoffError(error, elements.handoff_import_error);
+    }
+});
+elements.handoff_confirm.addEventListener("change", () => {
+    elements.handoff_submit.disabled = !state.handoff?.provider.available || !elements.handoff_confirm.checked;
+});
+const VERDICT_LABELS = { COMMENT: "comment", APPROVE: "approval", REQUEST_CHANGES: "request for changes" };
+const VERDICT_ARTICLES = { COMMENT: "a comment", APPROVE: "an approval", REQUEST_CHANGES: "a request for changes" };
+const handoffVerdict = () => elements.handoff_verdict.querySelector("input:checked")?.value || "COMMENT";
+// Consent names the exact verdict; changing the verdict requires confirming again.
+function renderHandoffConsent() {
+    const verdict = handoffVerdict();
+    const comments = state.handoff?.provider?.comments || 0;
+    elements.handoff_confirm_text.textContent = `I reviewed this summary${comments ? ` and ${countLabel(comments, "line comment")}` : ""} and choose to post ${comments ? "them" : "it"} as ${
+        VERDICT_ARTICLES[verdict]} under my GitHub identity.`;
+    elements.handoff_submit.textContent = { COMMENT: "Submit comment", APPROVE: "Submit approval", REQUEST_CHANGES: "Request changes" }[verdict];
+    elements.handoff_submit.classList.toggle("handoff-danger", verdict === "REQUEST_CHANGES");
+    elements.handoff_submit.classList.toggle("handoff-primary", verdict !== "REQUEST_CHANGES");
+}
+elements.handoff_verdict.addEventListener("change", () => {
+    elements.handoff_confirm.checked = false;
+    elements.handoff_submit.disabled = true;
+    renderHandoffConsent();
+});
+function handoffProviderStatus(message) {
+    elements.handoff_status.textContent = message;
+    elements.handoff_provider_status.textContent = message;
+    elements.handoff_provider_status.focus({ preventScroll: true });
+    elements.handoff_provider_status.scrollIntoView({ block: "nearest" });
+}
+elements.handoff_submit.addEventListener("click", async () => {
+    const epoch = state.handoffEpoch;
+    elements.handoff_submit.disabled = true;
+    elements.handoff_confirm.disabled = true;
+    elements.handoff_refresh.disabled = true;
+    elements.handoff_error.classList.add("hidden");
+    elements.handoff_provider_error.classList.add("hidden");
+    const verdict = handoffVerdict();
+    handoffProviderStatus(`Submitting the ${VERDICT_LABELS[verdict]}. Waiting for GitHub's receipt; do not submit again.`);
+    try {
+        const receipt = await api("/api/review-handoff/submit", { method: "POST",
+            body: JSON.stringify({ token: state.handoff?.token, confirm: elements.handoff_confirm.checked, event: verdict, summary: elements.handoff_summary.value }) });
+        if (epoch === state.handoffEpoch) {
+            // The preview is consumed: the destination line no longer promises a pending post.
+            const destination = elements.handoff_provider.querySelector("a");
+            elements.handoff_provider.replaceChildren(...(destination ? ["Destination: ", destination] : []),
+                ` · Commit ${String(receipt.commit || "").slice(0, 12)} · review posted.`);
+            elements.handoff_confirm.checked = false;
+            elements.handoff_summary.value = "";
+            handoffProviderStatus(`Posted ${VERDICT_LABELS[verdict]} on commit ${String(receipt.commit || "").slice(0, 12)}${
+                receipt.comments ? ` with ${countLabel(receipt.comments, "line comment")}` : ""}.${receipt.drafts_warning ? ` ${receipt.drafts_warning}` : ""}`);
+            if (receipt.url) {
+                const link = el("a", "", "Open the review on GitHub");
+                link.href = receipt.url;
+                link.target = "_blank";
+                link.rel = "noopener noreferrer";
+                elements.handoff_provider_status.append(" ", link);
+            }
+            loadPrReview({ force: true });
+        }
+    } catch (error) {
+        if (epoch === state.handoffEpoch) {
+            handoffProviderStatus("No submission receipt. Read the error and check the PR before preparing another submission.");
+            handoffError(error, elements.handoff_provider_error);
+        }
+    } finally { elements.handoff_refresh.disabled = false; }
+});
+
+function queueReviewCursor() {
+    clearTimeout(state.cursorSaveTimer);
+    if (!state.progressReady || !state.source) return;
+    const snapshot = state.reviewLedgerStorageKey;
+    state.cursorSaveTimer = setTimeout(() => {
+        if (snapshot !== state.reviewLedgerStorageKey || state.progressSaving || !state.source) return;
+        const cursor = currentReviewCursor();
+        if (JSON.stringify(cursor) === JSON.stringify(state.savedReviewCursor)) return;
+        persistReviewEntries(new Map(state.reviewLedger), cursor, { quiet: true, background: true });
+    }, 800);
+}
+elements.source.addEventListener("scroll", () => { sourceScrollPosition(); queueReviewCursor(); }, { passive: true });
 
 function markSelectedCards() {
     document.querySelectorAll(".review-card[data-item-id]").forEach((card) =>
         card.classList.toggle("is-selected", card.dataset.itemId === state.selected?.id));
 }
 
+function openImpact(item = state.selected) {
+    rememberViewReturn();
+    rememberWorkspaceSource();
+    setSourceFocus(false);
+    state.reviewPage = "review";
+    state.exploring = true;
+    setDiscussionMode(false);
+    const model = state.payload?.model;
+    if (!model) {
+        showError(new Error("Wait for the saved review to load before opening impact."));
+        return;
+    }
+    if (item?.kind === "section") {
+        const section = state.sectionData?.sections.find((section) => section.id === item.id);
+        item = section ? { id: section.subject_id } : { id: `file:${item.path}` };
+    }
+    const seed = item?.node_id || item?.package_id || item?.target
+        || item?.evidence_ids?.find((id) => model.evidence?.[id]?.path) || item?.id
+        || model.attention?.find((finding) => finding.node_id)?.node_id
+        || model.nodes.find((node) => node.change !== "unchanged" && ["function", "method"].includes(node.kind))?.id;
+    state.impact = { seed, depth: 1, direction: "both", pendingFocus: true };
+    state.mode = "impact";
+    state.selected = null;
+    renderEmptyDetail();
+    setDetailVisible(false);
+    state.source = null;
+    state.selectionEpoch++;
+    elements.source_panel.classList.add("hidden");
+    render();
+}
+
+function focusImpactNode(id = state.impact?.seed) {
+    const nodes = [...elements.graph.querySelectorAll(".impact-graph .node")];
+    const node = nodes.find((node) => node.dataset.nodeId === id) || nodes[0];
+    node?.scrollIntoView({ block: "nearest" });
+    node?.focus({ preventScroll: true });
+}
+
+function renderImpact(model, focus = null) {
+    const options = state.impact || {};
+    const slice = impactSlice(model, options.seed, { depth: options.depth || 1, direction: options.direction || "both" });
+    elements.graph.replaceChildren();
+    const controls = el("div", "impact-toolbar");
+    controls.append(el("p", "muted", "Static evidence, not proof of a defect. Arrows retain their dependency direction: caller → callee."));
+    const counts = el("p", "impact-counts", Object.entries(slice.counts).map(([role, count]) => `${role}: ${count}`).join(" · "));
+    const direction = el("select", "");
+    direction.setAttribute("aria-label", "Impact relationships");
+    for (const [value, label] of [["both", "Consumers and dependencies"], ["consumers", "Consumers"], ["dependencies", "Dependencies"]]) {
+        const option = el("option", "", label);
+        option.value = value;
+        option.selected = value === (options.direction || "both");
+        direction.append(option);
+    }
+    direction.addEventListener("change", () => { state.impact.direction = direction.value; renderImpact(model, "direction"); });
+    const expand = el("button", "btn", `Expand one step (${options.depth || 1}/4)`);
+    expand.type = "button";
+    expand.disabled = options.depth >= 4 || !slice.boundary;
+    expand.addEventListener("click", () => { state.impact.depth++; renderImpact(model, "expand"); });
+    controls.append(counts, direction, expand);
+    const seedNode = model.nodes.find((node) => node.id === options.seed);
+    const direct = seedNode?.metrics?.direct_callers || 0;
+    const callers = direct + (seedNode?.metrics?.transitive_callers || 0);
+    const drawnConsumers = slice.counts?.["Potential consumer"] || 0;
+    if (callers > drawnConsumers) {
+        controls.append(el("p", "muted", `Saved analysis records ${countLabel(callers, "caller")} of ${seedNode.name} (${direct.toLocaleString()} direct); this view draws ${
+            countLabel(drawnConsumers, "potential consumer")} at depth ${options.depth || 1}. Caller counts include every recorded call path; the view draws each consumer once and bounds its size.`));
+    }
+    for (const gap of slice.gaps) controls.append(el("p", "muted", gap));
+    const graph = el("div", "impact-graph");
+    elements.graph.append(controls, graph);
+    const selectImpact = (item) => {
+        if (state.selected?.id !== item.id) setDiscussionMode(false);
+        state.selected = item;
+        renderDetail(item);
+        setDetailVisible(true);
+        const evidence = el("section", "impact-evidence");
+        evidence.append(el("h3", "", item.impact_role || "Relationship evidence"));
+        const path = slice.paths[item.id]?.length ? slice.paths[item.id]
+            : item.source ? [item.id] : slice.edges.filter((edge) => edge.source === item.id || edge.target === item.id).map((edge) => edge.id);
+        const related = path.map((id) => slice.edges.find((edge) => edge.id === id)).filter(Boolean);
+        for (const edge of related) {
+            const source = model.nodes.find((node) => node.id === edge.source);
+            const target = model.nodes.find((node) => node.id === edge.target);
+            evidence.append(el("p", "", `${source?.name || edge.source} ${edge.change === "removed" ? `formerly ${edge.type} (base snapshot)` : edge.type} ${target?.name || edge.target} · relationship confidence: ${edge.confidence || "not reported"}`));
+            for (const id of edge.evidence_ids || []) if (model.evidence?.[id]) evidence.append(evidenceButton(id));
+        }
+        const actions = el("div", "impact-actions");
+        if (item.path) {
+            const open = el("button", "btn", "Open source");
+            open.type = "button";
+            open.addEventListener("click", () => {
+                state.sourceReturnFocus = [...elements.graph.querySelectorAll(".impact-graph .node")]
+                    .find((node) => node.dataset.nodeId === item.id);
+                selectItem(item, false);
+            });
+            actions.append(open);
+        }
+        const ask = el("button", "btn", "Ask about this");
+        ask.type = "button";
+        ask.addEventListener("click", () => discussItem(item).catch(showError));
+        actions.append(ask);
+        evidence.append(actions);
+        if (item.impact_role === "Related test") evidence.append(el("p", "muted", "Static test relationship. Execution of this affected behavior is not established by this graph."));
+        elements.detail.append(evidence);
+    };
+    renderGraph(graph, slice.nodes, slice.edges, selectImpact, { viewport: true, focusId: options.seed,
+        emptyText: `No saved static relationships were found for ${model.nodes.find((node) => node.id === options.seed)?.name
+            || String(options.seed || "this item").replace(/^file:/, "")}. Non-code files and isolated changes have no impact graph.` });
+    if (state.selected && state.detailVisible) selectImpact(state.selected);
+    if (focus === "direction" || (focus === "expand" && expand.disabled)) direction.focus({ preventScroll: true });
+    else if (focus === "expand") expand.focus({ preventScroll: true });
+    else if (options.pendingFocus) {
+        options.pendingFocus = false;
+        focusImpactNode();
+    }
+}
+
+elements.impact_view.addEventListener("click", () => {
+    if (state.mode === "impact") returnPreviousView();
+    else openImpact();
+});
+elements.source_impact.addEventListener("click", () => {
+    if (state.selected?.id?.startsWith("package:") || state.selected?.package_id) {
+        openImpact(state.selected);
+        return;
+    }
+    const source = state.source;
+    const symbol = state.payload?.model?.nodes.filter((node) => node.path === source?.path
+        && node.start_line <= source.start_line && node.end_line >= source.start_line
+        && ["function", "method", "constructor", "destructor", "operator", "lambda"].includes(node.kind))
+        .sort((a, b) => (a.end_line - a.start_line) - (b.end_line - b.start_line))[0];
+    openImpact(symbol || { id: `file:${source?.path}` });
+});
+
+function openSections(location = null) {
+    if (!state.payload?.model) {
+        showError(new Error("Wait for the saved review to load before opening sections."));
+        return;
+    }
+    if (state.reviewPage === "review" && !state.exploring) {
+        state.navigationMode = "groups";
+        state.navigationKey = null;
+        state.navigationQuery = "";
+        elements.workspace_search.value = "";
+        state.navigationOpen = true;
+        renderWorkspaceNavigation();
+        renderWorkspaceShell();
+        // Reveal the file's layer in the rail: expand it, bring it into view and briefly mark it.
+        const group = state.workspaceNavigation?.groups.find((item) => item.id === state.activeReviewGroup)
+            || state.workspaceNavigation?.groups.find((item) => item.files.some((file) => file.path === state.source?.path));
+        const layer = group && [...elements.workspace_nav_list.querySelectorAll(".workspace-layer")]
+            .find((item) => item.dataset.layer === group.layer);
+        if (!layer) return;
+        layer.open = true;
+        layer.scrollIntoView({ block: "start" });
+        layer.classList.remove("is-revealed");
+        void layer.offsetWidth;
+        layer.classList.add("is-revealed");
+        setTimeout(() => layer.classList.remove("is-revealed"), 1800);
+        const current = [...layer.querySelectorAll(".workspace-file")].find((file) => file.getAttribute("aria-current") === "location");
+        (current || layer.querySelector("summary")).focus({ preventScroll: true });
+        return;
+    }
+    rememberViewReturn();
+    state.sectionFocus = location;
+    state.mode = "sections";
+    state.query = "";
+    elements.review_search.value = "";
+    setDiscussionMode(false);
+    state.source = null;
+    state.selected = null;
+    state.selectionEpoch++;
+    elements.source_panel.classList.add("hidden");
+    renderEmptyDetail();
+    setDetailVisible(false);
+    render();
+}
+
+function sectionSourceButton(section, range, label = null) {
+    const button = sourceReferenceButton(label || `${range.path}:${range.line}${range.side === "base" ? " (base)" : ""}`,
+        { path: range.path, lines: [range.line], side: range.side });
+    button.addEventListener("click", () => {
+        if (state.selected?.id !== section.id) setDiscussionMode(false);
+        state.selected = { id: section.id, kind: "section", title: section.title, path: range.path };
+        state.sourceReturnFocus = button;
+    });
+    return button;
+}
+
+function ensureSectionData() {
+    const key = `${state.payload.review_generation}:${state.payload.rule_check?.completed_at || ""}`;
+    if (state.sectionDataKey === key) return state.sectionData;
+    if (state.payload.loading) return null;
+    if (state.sectionDataKey !== key) {
+        if (state.sectionLoadingKey !== key && state.sectionError?.key !== key) {
+            state.sectionLoadingKey = key;
+            state.sectionPromise = api("/api/review-sections").then((data) => {
+                if (state.sectionLoadingKey !== key) return;
+                state.sectionData = data;
+                state.sectionDataKey = key;
+                state.sectionLoadingKey = null;
+                render();
+            }, (error) => {
+                if (state.sectionLoadingKey !== key) return;
+                state.sectionError = { key, message: error.message };
+                state.sectionLoadingKey = null;
+                if (state.mode === "sections" || state.reviewPage === "review") render();
+            });
+        }
+    }
+    return null;
+}
+
+function renderSections(model) {
+    const key = `${state.payload.review_generation}:${state.payload.rule_check?.completed_at || ""}`;
+    elements.graph.replaceChildren();
+    const data = ensureSectionData();
+    if (!data) {
+        if (state.sectionError?.key === key) {
+            const retry = el("button", "btn", "Retry sections");
+            retry.type = "button";
+            retry.addEventListener("click", () => { state.sectionError = null; render(); });
+            elements.graph.append(el("p", "error", state.sectionError.message), retry);
+        } else elements.graph.append(el("p", "muted", "Building source-derived review sections…"));
+        return;
+    }
+    const behavior = data.sections.filter((section) => section.kind === "behavior");
+    const supporting = data.sections.filter((section) => section.kind !== "behavior");
+    const sectionFiles = (section) => [...new Set(section.ranges.map((range) => range.path))];
+    const filesReviewed = (section) => sectionFiles(section).filter((path) => state.reviewLedger.get(fileReviewId(path))?.disposition === "reviewed").length;
+    const reviewed = behavior.filter((section) => filesReviewed(section) === sectionFiles(section).length).length;
+    const list = el("div", "review-sections");
+    list.append(el("p", "", `${countLabel(behavior.length, "behavior section")} · ${countLabel(data.represented_files, "changed file")} represented · ${countLabel(reviewed, "section")} with every file reviewed`),
+        el("p", "muted", `These are the analyzer's source-linked sections, shown inside the reading-path layers. Progress comes from whole-file decisions in the Review rail. AI analysis: ${data.analysis_status}. ${data.note}`));
+    const focusLocation = state.sectionFocus;
+    const focusedSection = focusLocation && (data.sections.find((section) => section.ranges.some((range) =>
+        range.path === focusLocation.path && range.side === focusLocation.side
+        && focusLocation.line >= range.line && focusLocation.line <= range.end_line))
+        || data.sections.find((section) => section.ranges.some((range) => range.path === focusLocation.path)));
+    if (focusLocation && !focusedSection) list.append(el("p", "muted",
+        "This source location has no changed section owner. Sections describe changed code, not every related dependency."));
+    const query = state.query.toLowerCase();
+    const matches = (section) => !query || `${section.title} ${section.summary} ${section.ranges.map((range) => range.path).join(" ")}`.toLowerCase().includes(query);
+    const navigation = layeredNavigation();
+    const layerIndex = new Map((navigation?.layers || []).map((layer, index) => [layer.id, index]));
+    const sectionLayer = (section) => {
+        const votes = new Map();
+        for (const range of section.ranges) {
+            const layer = layerOf(navigation, { path: range.path });
+            if (layer) votes.set(layer, (votes.get(layer) || 0) + 1);
+        }
+        return [...votes].sort((a, b) => b[1] - a[1] || layerIndex.get(a[0].id) - layerIndex.get(b[0].id))[0]?.[0] || null;
+    };
+    const ordered = behavior.filter(matches).map((section) => ({ section, layer: sectionLayer(section) }))
+        .sort((a, b) => (a.layer ? layerIndex.get(a.layer.id) : Infinity) - (b.layer ? layerIndex.get(b.layer.id) : Infinity)
+            || a.section.number - b.section.number);
+    const titles = new Map(data.sections.map((section) => [section.id, section.title]));
+    let focused = null;
+    let currentLayer;
+    for (const { section, layer } of ordered) {
+        if (navigation && layer !== currentLayer) {
+            currentLayer = layer;
+            list.append(el("h3", "review-plan-layer", layer ? `Sections in ${layerLabel(layer)}` : "Sections outside the reading path"));
+        }
+        const shownRanges = query && section.ranges.some((range) => range.path.toLowerCase().includes(query))
+            ? section.ranges.filter((range) => range.path.toLowerCase().includes(query)) : section.ranges;
+        const details = el("details", "section-card");
+        details.dataset.sectionId = section.id;
+        const requested = section.id === focusedSection?.id;
+        details.open = requested || state.openSectionKeys?.has(section.id);
+        details.addEventListener("toggle", () => {
+            if (!details.isConnected) return;
+            state.openSectionKeys ||= new Set();
+            if (details.open) state.openSectionKeys.add(section.id);
+            else state.openSectionKeys.delete(section.id);
+        });
+        const summary = el("summary", "");
+        if (layer) {
+            const chip = layerMarker(layer, "layer-chip layer-chip-inline");
+            chip.title = layerLabel(layer);
+            summary.append(chip);
+        }
+        summary.append(document.createTextNode(section.title));
+        details.append(summary, el("p", "muted", section.grouping || "Source-linked changed contract and consumers"),
+            el("p", "", section.summary));
+        if (section.summary_citations.length) {
+            details.append(el("p", "muted", "AI interpretation; verify against the cited source."));
+            for (const citation of section.summary_citations) details.append(sectionSourceButton(section,
+                { path: citation.path, line: citation.line, side: citation.side }));
+        }
+        for (const dependency of section.depends_on) {
+            const link = el("button", "link-button", `Depends on: ${titles.get(dependency) || "another section"}`);
+            link.type = "button";
+            link.addEventListener("click", () => {
+                const target = [...elements.graph.querySelectorAll(".section-card")].find((node) => node.dataset.sectionId === dependency);
+                if (!target) return;
+                target.open = true;
+                target.scrollIntoView({ block: "nearest" });
+                target.querySelector("summary").focus();
+            });
+            details.append(link);
+        }
+        if (section.cyclic) details.append(el("p", "muted", "A dependency cycle prevents a strict reading order."));
+        const actions = el("div", "section-actions");
+        actions.append(sectionSourceButton(section, shownRanges[0], "Open first range"));
+        const ask = el("button", "", "Ask about section");
+        ask.type = "button";
+        ask.addEventListener("click", () => {
+            state.sourceReturnFocus = ask;
+            discussItem({ id: section.id, kind: "section", title: section.title, path: section.ranges[0].path }).catch(showError);
+        });
+        const progress = el("span", "muted", `${filesReviewed(section)} of ${countLabel(sectionFiles(section).length, "file")} reviewed`);
+        actions.append(ask, progress);
+        details.append(actions);
+        const ranges = el("details", "section-ranges");
+        ranges.open = state.openSectionRangeKeys?.has(section.id) || false;
+        ranges.append(el("summary", "", `${countLabel(shownRanges.length, "source range")}${shownRanges.length < section.ranges.length ? ` of ${section.ranges.length} matching filter` : ""}`));
+        ranges.addEventListener("toggle", () => {
+            if (!ranges.isConnected) return;
+            state.openSectionRangeKeys ||= new Set();
+            if (ranges.open) state.openSectionRangeKeys.add(section.id);
+            else state.openSectionRangeKeys.delete(section.id);
+            if (!ranges.open || ranges.dataset.loaded) return;
+            ranges.dataset.loaded = "true";
+            const entries = el("ul", "");
+            for (const range of shownRanges) {
+                const row = el("li", "");
+                row.append(sectionSourceButton(section, range));
+                entries.append(row);
+            }
+            ranges.append(entries);
+        });
+        details.append(ranges);
+        const tests = el("details", "");
+        tests.append(el("summary", "", `${countLabel(section.tests.length, "related test")} (static links)`));
+        tests.addEventListener("toggle", () => {
+            if (!tests.isConnected) return;
+            if (!tests.open || tests.dataset.loaded) return;
+            tests.dataset.loaded = "true";
+            tests.append(el("p", "muted", "A source relationship is not proof that the changed behavior executed."));
+            for (const test of section.tests) tests.append(sectionSourceButton(section,
+                { path: test.path, line: test.start_line || 1, side: "current" }));
+        });
+        details.append(tests);
+        list.append(details);
+        if (requested) focused = summary;
+    }
+    const other = supporting.filter(matches);
+    if (other.length) {
+        const details = el("details", "section-card supporting-sections");
+        details.append(el("summary", "", `${countLabel(other.length, "supporting file")} without an analyzer section`),
+            el("p", "muted", "These files remain in scope. The Review rail may still attach some of them to a file by an import or call found in this change, or by a matching test name."));
+        details.addEventListener("toggle", () => {
+            if (!details.isConnected) return;
+            if (!details.open || details.dataset.loaded) return;
+            details.dataset.loaded = "true";
+            const entries = el("ul", "");
+            let target = null;
+            for (const section of other) {
+                const row = el("li", "");
+                const range = section.ranges[0];
+                const open = sectionSourceButton(section, range);
+                if (model.source_files?.[range.path]?.binary) {
+                    open.disabled = true;
+                    open.title = "Binary file: no saved text view is available.";
+                }
+                row.append(open);
+                entries.append(row);
+                if (focusLocation?.path === range.path) target = open;
+            }
+            details.append(entries);
+            target?.scrollIntoView({ block: "nearest" });
+            target?.focus({ preventScroll: true });
+        });
+        if (other.some((section) => section.id === focusedSection?.id)) details.open = true;
+        list.append(details);
+    }
+    if (!behavior.some(matches) && !other.length) list.append(el("p", "muted", "No sections match this filter."));
+    elements.graph.append(list);
+    focused?.scrollIntoView({ block: "nearest" });
+    focused?.focus({ preventScroll: true });
+    state.sectionFocus = null;
+}
+
+elements.sections_view.addEventListener("click", () => {
+    if (state.mode === "sections") returnPreviousView();
+    else openSections();
+});
+elements.source_section.addEventListener("click", () => {
+    if (state.source) openSections({ path: state.source.path, line: Number(state.source.start_line) || 1,
+        side: state.source.focus_side || "current" });
+});
+
 function openReviewItem(item) {
     if (item.collect_mode) {
+        rememberViewReturn();
         state.mode = item.collect_mode;
         state.stack = [];
         clearSelection();
@@ -485,17 +2836,19 @@ function collapseSizeFindings(items, model) {
         return `${(node?.name || "unit").split(".").pop()} ${lines}`;
     };
     const shown = sizes.slice(0, 4).map(label).join(" · ");
+    // A grouped card carries its highest member priority, matching the handoff's grouped line.
+    const top = Math.max(...sizes.map((item) => concernPriority(item) ?? -1));
     const group = {
         id: "group:size",
-        title: `Large changes · ${sizes.length} areas`,
+        title: `Large changes · ${countLabel(sizes.length, "area")}`,
         body: `${shown}${sizes.length > 4 ? ` · +${sizes.length - 4} more` : ""}`,
-        impact_score: sizes[0].impact_score,
+        impact_score: top >= 0 ? top : null,
         severity: sizes[0].severity,
         collect_mode: "areas",
         members: sizes,
     };
     const rest = items.filter((item) => !sizes.includes(item));
-    const position = rest.findIndex((item) => (item.impact_score || 0) < (group.impact_score || 0));
+    const position = rest.findIndex((item) => (concernPriority(item) ?? 0) < (group.impact_score ?? 0));
     rest.splice(position === -1 ? rest.length : position, 0, group);
     return rest;
 }
@@ -537,7 +2890,9 @@ function renderScopeFindings(model, parent, findings) {
     const section = el("section", "scope-findings");
     section.setAttribute("aria-label", "Findings in this scope");
     const closedCount = scoped.filter((item) => isFindingClosed(item, state.closedFindingKeys)).length;
-    section.append(el("h3", "", `${scoped.length - closedCount} active${closedCount ? ` · ${closedCount} closed` : ""} review findings in ${parent.name}`));
+    const activeCount = scoped.length - closedCount;
+    section.append(el("h3", "", `${countLabel(activeCount, "active review finding")}${
+        closedCount ? ` · ${countLabel(closedCount, "closed review finding")}` : ""} in ${parent.name}`));
     const nodes = new Map(model.nodes.map((node) => [node.id, node]));
     for (const finding of scoped) {
         const target = nodes.get(finding.node_id);
@@ -553,35 +2908,8 @@ function renderScopeFindings(model, parent, findings) {
     elements.graph.prepend(section);
 }
 
-function groupFindings(items) {
-    const groups = new Map();
-    for (const item of items) {
-        const key = item.node_id ? `node:${item.node_id}` : item.edge_id ? `edge:${item.edge_id}` : item.id;
-        const existing = groups.get(key);
-        if (!existing) {
-            groups.set(key, { ...item, evidence_ids: [...(item.evidence_ids || [])], impact_factors: [...(item.impact_factors || [])], related_findings: [item.type] });
-            continue;
-        }
-        existing.evidence_ids = [...new Set([...existing.evidence_ids, ...(item.evidence_ids || [])])];
-        existing.impact_factors = [...new Set([...existing.impact_factors, ...(item.impact_factors || [])])];
-        existing.related_findings = [...new Set([...existing.related_findings, item.type])];
-        if ((item.impact_score || 0) > (existing.impact_score || 0)) {
-            existing.type = item.type;
-            existing.title = item.title;
-            existing.reason = item.reason;
-            existing.severity = item.severity;
-            existing.impact_score = item.impact_score;
-        }
-    }
-    return [...groups.values()].map((item) => {
-        if (item.related_findings.length > 1) {
-            item.reason = `${item.reason} Also flagged for ${item.related_findings.filter((type) => type !== item.type).join(", ").replaceAll("_", " ")}.`;
-        }
-        return item;
-    }).sort((a, b) => (b.impact_score || 0) - (a.impact_score || 0));
-}
-
 function resetToGraph() {
+    rememberViewReturn();
     state.mode = "graph";
     state.stack = [];
     clearSelection();
@@ -591,6 +2919,7 @@ function resetToGraph() {
 }
 
 function resetToWalkthrough() {
+    rememberViewReturn();
     state.mode = "walkthrough";
     state.stack = [];
     clearSelection();
@@ -601,7 +2930,9 @@ function resetToWalkthrough() {
 
 function renderBreadcrumbs() {
     elements.breadcrumbs.replaceChildren();
-    const plan = el("button", "", "Review plan");
+    // The plan/architecture trail belongs to Explore; the Overview has a single reading path.
+    elements.breadcrumbs.classList.toggle("hidden", state.reviewPage === "overview" || state.reviewPage === "finish");
+    const plan = el("button", "", "Attention");
     plan.type = "button";
     plan.addEventListener("click", resetToWalkthrough);
     elements.breadcrumbs.append(plan);
@@ -619,6 +2950,7 @@ function renderBreadcrumbs() {
         const button = el("button", "", item.name || item.qualified_name);
         button.type = "button";
         button.addEventListener("click", () => {
+            rememberViewReturn("level");
             state.stack = state.stack.slice(0, index + 1);
             clearSelection();
             render();
@@ -645,6 +2977,7 @@ function maybeDrill(item) {
             selectItem(item, true);
             return;
         }
+        rememberViewReturn("level");
         state.stack.push(item);
         clearSelection();
         render();
@@ -664,7 +2997,8 @@ function selectAggregateEdge(edge, model) {
             ...edge,
             kind: "edge",
             name: `${source} → ${target}`,
-            reason: `${edge.added_count || 0} added and ${edge.removed_count || 0} removed ${edge.kind} relationships.`,
+            reason: `${edge.kind}: ${countLabel(edge.added_count || 0, "relationship")} added and ${
+                countLabel(edge.removed_count || 0, "relationship")} removed.`,
         });
         return;
     }
@@ -675,7 +3009,8 @@ function selectAggregateEdge(edge, model) {
         added_count: edge.added_count,
         removed_count: edge.removed_count,
         underlying_edge_ids: edge.underlying_edge_ids,
-        reason: `${edge.added_count || 0} added and ${edge.removed_count || 0} removed ${edge.kind} relationships. Showing representative source evidence.`,
+        reason: `${edge.kind}: ${countLabel(edge.added_count || 0, "relationship")} added and ${
+            countLabel(edge.removed_count || 0, "relationship")} removed. Showing representative source evidence.`,
     });
 }
 function field(label, value) {
@@ -688,7 +3023,321 @@ function field(label, value) {
     return row;
 }
 
+function overviewPlan() {
+    const model = state.payload?.model;
+    return model ? buildReviewPlan(model, state.payload.decision_map, state.payload.test_run,
+        [...groupFindings(model.attention || []), ...(state.payload.generated_observations || [])]) : [];
+}
+
+// One layered model shared by the rail, Overview and Finish so names and order always agree.
+function layeredNavigation() {
+    const model = state.payload?.model;
+    const data = model && !state.payload.loading ? ensureSectionData() : null;
+    if (!data) return null;
+    const key = `${state.payload.review_generation}:${state.sectionDataKey}`;
+    if (state.layeredNavigationKey !== key) {
+        state.layeredNavigation = workspaceNavigation(model, data);
+        state.layeredNavigationKey = key;
+    }
+    return state.layeredNavigation;
+}
+
+function layerOf(navigation, entry) {
+    if (!navigation || !entry) return null;
+    if (!navigation.layerByPath) {
+        navigation.layerByPath = new Map();
+        for (const layer of navigation.layers) for (const group of layer.groups) for (const file of group.files) {
+            if (!navigation.layerByPath.has(file.path)) navigation.layerByPath.set(file.path, layer);
+        }
+    }
+    // Each changed file lives in exactly one layer, so its path is authoritative; a saved group may predate the current layering.
+    const byPath = entry.path && navigation.layerByPath.get(entry.path);
+    if (byPath) return byPath;
+    const group = entry.group && navigation.groups.find((item) => item.id === entry.group);
+    return group ? navigation.layers.find((layer) => layer.id === group.layer) || null : null;
+}
+
+// AI step titles name what the reader does in a layer; the deterministic area name stays as the subtitle and fallback.
+const layerTitle = (layer) => layer ? state.payload?.annotations?.layers?.titles?.[layer.id] || layer.name : "";
+const layerLabel = (layer) => layer ? `${layer.number ? `${layer.number}. ` : ""}${layerTitle(layer)}` : "";
+
+// Numbered layers show their step number in a circle. Supporting files are outside the reading order, so they show a
+// folder (GitHub's file-directory octicon) instead of an empty-looking circle.
+function layerMarker(layer, className) {
+    if (layer?.number) return el("span", className, String(layer.number));
+    const marker = el("span", `${className} is-unnumbered`);
+    marker.title = "Supporting files: outside the numbered reading order";
+    marker.setAttribute("aria-label", "Supporting files");
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("aria-hidden", "true");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", "M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75ZM1.5 2.75a.25.25 0 0 1 .25-.25H5a.25.25 0 0 1 .2.1l.9 1.2c.33.44.85.7 1.4.7h6.75a.25.25 0 0 1 .25.25v8.5a.25.25 0 0 1-.25.25H1.75a.25.25 0 0 1-.25-.25V2.75Z");
+    svg.append(path);
+    marker.append(svg);
+    return marker;
+}
+
+function dependencyLabel(navigation, dependency) {
+    const layer = navigation?.layers.find((item) => item.number === dependency.number);
+    return layer ? layerLabel(layer) : `${dependency.number}. ${dependency.name}`;
+}
+
+// The AI badge stays attached to the title's last word, so wrapping never makes the area name look AI-written.
+function titleWithBadge(title, isAi, hint) {
+    const strong = el("strong", "");
+    if (!isAi) { strong.textContent = title; return strong; }
+    const words = title.split(" ");
+    const tail = el("span", "title-tail", words.pop());
+    const badge = el("span", "workspace-layer-ai", "AI");
+    badge.title = hint;
+    tail.append(" ", badge);
+    strong.append(words.length ? `${words.join(" ")} ` : "", tail);
+    return strong;
+}
+
+function layerHeading(layer, { path = true } = {}) {
+    const name = el("span", "layer-title");
+    const title = layerTitle(layer);
+    name.append(titleWithBadge(title, title !== layer.name, "AI-written step title; the area name is shown beside it"));
+    const area = [title !== layer.name ? layer.name : null, path && layer.path && layer.path !== "/" && !layer.supporting ? layer.path : null].filter(Boolean);
+    if (area.length) name.append(el("span", "layer-area muted", area.join(" · ")));
+    if (layer.number && layer.number > 1 && !layer.dependsOn.length) {
+        const independent = el("span", "layer-independent", "independent");
+        independent.title = "No changed file in this layer imports or calls an earlier layer; it can be read in any order.";
+        name.append(independent);
+    }
+    return name;
+}
+
+function layerProgress(layer) {
+    const files = layer.groups.flatMap((group) => group.files);
+    return { reviewed: files.filter((file) => state.reviewLedger.get(fileReviewId(file.path))?.disposition === "reviewed").length, total: files.length };
+}
+
+function openLayer(navigation, layer) {
+    const ids = new Set(layer.groups.map((group) => group.id));
+    const entries = reviewSequence(navigation).filter((entry) => ids.has(entry.group));
+    openFileReview(nextFileReview(entries, state.reviewLedger) || entries[0]).catch(showError);
+}
+
+function renderOverviewLayers(navigation) {
+    const list = elements.overview_layers;
+    list.replaceChildren();
+    if (!navigation) {
+        list.append(el("li", "overview-layer-detail muted", state.sectionError ? "Grouping is unavailable; every changed file is still reachable from Review."
+            : "Ordering the change into layers…"));
+        return;
+    }
+    const plan = overviewPlan();
+    for (const layer of navigation.layers) {
+        const paths = new Set(layer.groups.flatMap((group) => group.files.map((file) => file.path)));
+        const progress = layerProgress(layer);
+        const row = el("button", `overview-layer${layer.supporting ? " is-supporting" : ""}`);
+        row.type = "button";
+        const name = layerHeading(layer);
+        row.append(layerMarker(layer, "overview-layer-number"), name,
+            el("span", "overview-layer-progress", `${progress.reviewed}/${progress.total} reviewed`));
+        const intent = state.payload.annotations?.layers?.intents?.[layer.id];
+        const details = [];
+        const top = plan.filter((item) => item.path && paths.has(item.path)).sort((a, b) => b.score - a.score)[0];
+        if (layer.dependsOn.length) details.push(`builds on ${layer.dependsOn.map((dependency) => dependencyLabel(navigation, dependency)).join(", ")}`);
+        if (top) {
+            const title = top.title.replace(/^(?:[\w$]+\.)+(?=[\w$]+\.[\w$]+(?:\(|$))/, "").replace(/\(.{24,}\)$/, "(…)");
+            details.push(`top priority: ${title}${top.kind === "package" && top.reasons?.[0] ? ` (${top.reasons[0]})` : ""}`);
+        }
+        const detail = el("span", "overview-layer-detail");
+        if (intent) detail.append(el("span", "workspace-layer-ai", "AI"), document.createTextNode(intent));
+        else if (layer.summary) detail.append(document.createTextNode(layer.summary));
+        if (details.length) detail.append(document.createTextNode(`${intent || layer.summary ? " · " : ""}${details.join(" · ")}`));
+        row.append(detail);
+        layerSummaryStatus(row, layer, `overview-layer:${layer.id}`);
+        row.setAttribute("aria-label", `${layerLabel(layer)}: ${progress.reviewed} of ${progress.total} files reviewed. ${intent || layer.summary || ""}`);
+        row.addEventListener("click", () => openLayer(navigation, layer));
+        const item = el("li", "");
+        item.append(row);
+        list.append(item);
+    }
+}
+
+// Exactly where Start/Continue goes: the saved reading point if its file is still unreviewed, else the next rail file.
+function overviewDestination() {
+    const saved = liveReviewCursor();
+    const model = state.payload?.model;
+    const changed = saved && model?.changes.some((file) => file.path === saved.path && file.status !== "unchanged");
+    if (changed && (state.reviewLedger.get(fileReviewId(saved.path))?.disposition || "pending") === "pending") {
+        return { path: saved.path, line: saved.line > 1 ? saved.line : null, group: saved.group, resume: saved };
+    }
+    const next = nextFileReview(fileReviewQueue(), state.reviewLedger);
+    return next ? { path: next.path, group: next.group, entry: next } : null;
+}
+
+function renderReviewOverview() {
+    const payload = state.payload;
+    const model = payload?.model;
+    const hidden = !model || state.reviewPickerPending || state.reviewSubmitting || isEmptyReview(payload);
+    elements.review_overview.classList.toggle("hidden", Boolean(hidden));
+    if (hidden) return;
+    const target = payload.review_target;
+    const progress = fileReviewProgress(model, state.reviewLedger);
+    const next = nextFileReview(fileReviewQueue(), state.reviewLedger);
+    const changed = (model.changes || []).filter((change) => change.status !== "unchanged").length;
+    elements.overview_title.textContent = target?.intent?.subject || target?.intent?.title
+        || (target?.mode === "worktree" ? "Review your uncommitted changes" : target?.label || "Review this change");
+    const overviewBody = payload.annotations?.overview?.body;
+    // Once the summary is on screen, Copilot starts on the first item the reader will open.
+    if ((overviewBody || state.overviewError) && state.reviewPage === "overview" && state.progressReady) {
+        const destination = overviewDestination();
+        if (destination) prefetchAnnotation(destination.resume ? destination : destination.entry || destination);
+    }
+    const blurb = overviewBlurb(overviewBody);
+    const fullBlurb = overviewBlurb(overviewBody, { full: true });
+    elements.overview_description.replaceChildren();
+    if (blurb) {
+        elements.overview_description.append(el("p", "overview-copy-label muted", "AI change overview · verify against source"));
+        markdownContext.intent = state.briefIntent || null;
+        markdownContext.subject = null;
+        const expandable = fullBlurb.length > blurb.length;
+        const expanded = expandable && state.overviewExpandedKey === overviewBody;
+        const text = el("div", "overview-copy");
+        renderMarkdown(text, expanded ? fullBlurb : blurb);
+        elements.overview_description.append(text);
+        if (expandable) {
+            const toggle = el("button", "link-button overview-more", expanded ? "Show less" : "Show more");
+            toggle.type = "button";
+            toggle.setAttribute("aria-expanded", String(expanded));
+            toggle.addEventListener("click", () => {
+                state.overviewExpandedKey = expanded ? null : overviewBody;
+                renderReviewOverview();
+                elements.overview_description.querySelector(".overview-more")?.focus({ preventScroll: true });
+            });
+            (text.lastElementChild || text).append(document.createTextNode(" "), toggle);
+        }
+    } else if (state.overviewLoading) {
+        elements.overview_description.append(aiPlaceholder("overview", "Copilot is preparing the overview. You can start reviewing the saved code now.", 3));
+    } else {
+        elements.overview_description.append(el("p", "", state.overviewError
+            ? "The AI overview is unavailable. You can review the saved code now, or open change details to retry."
+            : "Review the saved changes and available evidence. Open change details for intent, metrics and AI summary status."));
+    }
+    if (payload.annotations?.overview?.refining) {
+        const rules = payload.rule_check;
+        const coverage = rules?.coverage;
+        const label = rules?.status === "running"
+            ? `Waiting for the repository rules review${coverage
+                ? ` (${coverage.completed_units} of ${coverage.total_units} evidence units reviewed)` : ""}...`
+            : "Copilot is refining this overview with deeper review evidence...";
+        elements.overview_description.append(aiPlaceholder("overview-refine", label, 2));
+    }
+    elements.overview_progress.textContent = `${progress.reviewed} of ${countLabel(changed, "changed file")} reviewed${
+        progress.followUp ? ` · ${countLabel(progress.followUp, "follow-up")}` : ""}`;
+    elements.overview_scope.textContent = "";
+    elements.overview_scope.classList.add("hidden");
+    elements.overview_start.textContent = next
+        ? state.savedReviewCursor || [...state.reviewLedger.values()].some((entry) => entry.disposition !== "pending") ? "Continue review" : "Start review"
+        : "Review summary";
+    elements.overview_start.title = next ? `Next changed file: ${next.path}` : "Review saved decisions and remaining concerns";
+    const navigation = layeredNavigation();
+    if (navigation) ensureLayerSummaries();
+    renderOverviewLayers(navigation);
+    const destination = overviewDestination();
+    if (destination && navigation) {
+        const layer = layerOf(navigation, destination);
+        const verb = elements.overview_start.textContent === "Continue review" ? "Continue" : "Start review";
+        elements.overview_start.textContent = `${verb} · ${layer ? `${layerLabel(layer)} › ` : ""}${destination.path.split("/").at(-1)}${destination.line ? `:${destination.line}` : ""}`;
+        elements.overview_start.title = `Opens ${destination.path}${destination.line ? ` at line ${destination.line}` : ""}`;
+    }
+    const disabled = Boolean(payload.loading || payload.cancelled || state.connectionLost || state.progressLoading);
+    elements.overview_start.disabled = disabled;
+    elements.overview_files.disabled = disabled;
+    elements.overview_files.textContent = `Browse all ${countLabel(changed, "file")}`;
+    elements.review_progress_status.textContent = state.progressLoading ? "Restoring session progress…"
+        : state.progressError ? `Progress unavailable: ${state.progressError}`
+            : state.progressReady && !state.progressDurable ? "This provider retains progress only in memory." : "";
+    elements.review_progress_retry.classList.toggle("hidden", !state.progressError);
+    elements.review_progress_backup.classList.toggle("hidden", !state.progressLegacyCopy);
+}
+
+function browseReviewFiles() {
+    rememberWorkspaceSource();
+    state.source = null;
+    elements.source_panel.classList.add("hidden");
+    state.reviewPage = "review";
+    state.navigationMode = "files";
+    state.navigationOpen = matchMedia("(max-width: 900px)").matches;
+    state.exploring = false;
+    state.mode = "files";
+    state.stack = [];
+    state.query = "";
+    elements.review_search.value = "";
+    render();
+    elements.graph.scrollIntoView({ block: "start" });
+    elements.graph.tabIndex = -1;
+    elements.graph.focus({ preventScroll: true });
+}
+
+elements.overview_start.addEventListener("click", async () => {
+    try {
+        await readySectionData();
+        const destination = overviewDestination();
+        await openOverviewDestination(destination);
+    } catch (error) { showError(error); }
+});
+elements.overview_files.addEventListener("click", browseReviewFiles);
+
+// The layer a piece of AI text refers to: an exact changed path, then a unique changed basename, then the longest changed symbol name.
+function textLayer(navigation, text) {
+    const model = state.payload?.model;
+    if (!navigation || !model) return null;
+    const changed = model.changes.filter((file) => file.status !== "unchanged").map((file) => file.path);
+    let path = changed.filter((candidate) => text.includes(candidate)).sort((a, b) => b.length - a.length)[0];
+    if (!path) {
+        const byName = changed.filter((candidate) => new RegExp(`(^|[^\\w.-])${candidate.split("/").at(-1).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[^\\w-])`).test(text));
+        if (byName.length === 1) path = byName[0];
+    }
+    if (!path) {
+        const changedSet = new Set(changed);
+        path = model.nodes.filter((node) => node.change && node.change !== "unchanged" && changedSet.has(node.path)
+            && node.name?.length >= 4 && new RegExp(`\\b${node.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(text))
+            .sort((a, b) => b.name.length - a.name.length)[0]?.path;
+    }
+    return path ? layerOf(navigation, { path }) : null;
+}
+
+// The AI brief's "Review order" is a lens over the layered reading path, not a competing order.
+function alignFocusPoints(body) {
+    const heading = [...body.querySelectorAll("h2")].find((item) => /review order/i.test(item.textContent));
+    if (!heading) return;
+    heading.textContent = "Focus points";
+    const navigation = layeredNavigation();
+    const note = el("p", "muted brief-focus-note", navigation
+        ? "AI suggestions, sorted by reading-path layer. Verify in code; Review follows the layers."
+        : "AI suggestions. Verify in code; Review follows the reading path.");
+    heading.after(note);
+    if (!navigation) return;
+    const index = new Map(navigation.layers.map((layer, position) => [layer.id, position]));
+    for (const list of heading.parentElement.querySelectorAll("ul, ol")) {
+        const items = [...list.children].map((item, position) => ({ item, position, layer: textLayer(navigation, item.textContent) }));
+        items.sort((a, b) => (a.layer ? index.get(a.layer.id) : Infinity) - (b.layer ? index.get(b.layer.id) : Infinity) || a.position - b.position);
+        for (const { item, layer } of items) {
+            if (layer) {
+                const chip = layerMarker(layer, "layer-chip layer-chip-inline");
+                chip.title = layerLabel(layer);
+                chip.setAttribute("aria-label", `Layer ${layerLabel(layer)}`);
+                item.prepend(chip);
+            }
+            list.append(item);
+        }
+        if (list.tagName === "OL") {
+            const replacement = el("ul", list.className);
+            replacement.append(...list.children);
+            list.replaceWith(replacement);
+        }
+    }
+}
+
 function renderChangeBrief() {
+    renderReviewOverview();
     const panel = elements.change_brief;
     panel.replaceChildren();
     const model = state.payload?.model;
@@ -711,7 +3360,7 @@ function renderChangeBrief() {
         });
         message.append(el("summary", "", intent.kind === "pr" ? "Full description and commits" : "Full commit message"));
         const meta = intent.kind === "pr"
-            ? [`#${intent.number}`, intent.author, `${intent.commits?.length || 0} commit${intent.commits?.length === 1 ? "" : "s"}`]
+            ? [`#${intent.number}`, intent.author, countLabel(intent.commits?.length || 0, "commit")]
             : [intent.sha?.slice(0, 7), intent.author, intent.date ? new Date(intent.date).toLocaleString() : null];
         message.append(el("p", "commit-meta", meta.filter(Boolean).join(" · ")));
         if (intent.body) message.append(el("pre", "commit-body", intent.body));
@@ -770,7 +3419,7 @@ function renderChangeBrief() {
     );
     panel.append(grid);
     if (split.source > 50 && ratio < 0.15) {
-        panel.append(el("p", "brief-warning", "Little or no test code changed relative to source."));
+        panel.append(el("p", "muted", "Test/source churn is descriptive, not coverage evidence. Inspect linked paths and saved test execution results."));
     }
 
     const annotation = state.payload?.annotations?.overview;
@@ -778,6 +3427,16 @@ function renderChangeBrief() {
     heading.append(el("h3", "", "Copilot change summary"));
     if (annotation?.body) heading.append(copyButton(annotation.body, "Copy summary"));
     panel.append(heading);
+    if (annotation?.body && (annotation.refining || annotation.basis || annotation.refine_error)) {
+        const status = el("p", `muted brief-ai-status${annotation.refining ? " is-refining" : ""}`,
+            annotation.refining ? "Quick summary from the saved code. Copilot is refining it with a deeper review of the change; it updates here when ready."
+                : annotation.refine_error ? `Quick summary from the saved code. Refining it with a deeper review failed: ${annotation.refine_error}`
+                : annotation.basis === "review" ? "Written from a deeper review of the change (the repository-rules and behavior pass)."
+                : "Written from the saved code.");
+        status.setAttribute("role", "status");
+        panel.append(status);
+        if (annotation.refining) panel.append(aiPlaceholder("overview-refine", "Copilot is refining the change summary...", 2));
+    }
     if (annotation?.body) {
         const body = revealOnce(el("div", "annotation-body brief-ai"), "overview");
         markdownContext.intent = state.briefIntent || null;
@@ -793,6 +3452,7 @@ function renderChangeBrief() {
             section.append(child);
         }
         body.replaceChildren(...sections);
+        alignFocusPoints(body);
         panel.append(body);
     } else if (state.overviewLoading) {
         panel.append(aiPlaceholder("overview", "Copilot is summarizing the whole change…", 4));
@@ -830,16 +3490,131 @@ function ruleCitations(content, path) {
     return merged;
 }
 
-async function openRuleFile(path, ranges) {
+async function openRuleFile(path, ranges, side = "current") {
+    rememberSourceOrigin({ overview: true });
+    rememberCurrentSource();
     const epoch = ++state.selectionEpoch;
     try {
-        await loadSource(`path=${encodeURIComponent(path)}&side=current`, epoch, "current", "reset", { highlights: ranges });
+        await loadSource(`path=${encodeURIComponent(path)}&side=${side}`, epoch, side, "push", { highlights: ranges });
     } catch (error) {
         if (epoch === state.selectionEpoch) showError(error);
     }
 }
 
 // Built-in check of the repository's own rule files, shown in the brief rather than among the user's prompts.
+function appendInternalReview(container, review, scope, resume) {
+    if (!review?.coverage) return;
+    const coverage = review.coverage;
+    const progress = el("p", "muted", `${countLabel(coverage.completed_files, "changed file")} analyzed of ${coverage.total_files}` +
+        ` · ${countLabel(coverage.completed_units, "evidence unit")} analyzed of ${coverage.total_units}` +
+        ` · ${coverage.supplied_units || 0} supplied` +
+        ` · ${review.requests ?? coverage.requests ?? 0} model requests this run` +
+        (coverage.phase ? ` · ${coverage.phase}` : ""));
+    progress.setAttribute("role", "status");
+    container.append(progress);
+    const actions = el("div", "action-row");
+    if (review.status === "running") {
+        container.append(aiPlaceholder(`review:${scope}`, "Copilot is reviewing the saved change...", 2));
+        const cancel = el("button", "", "Stop AI review");
+        cancel.type = "button";
+        cancel.addEventListener("click", async () => {
+            cancel.disabled = true;
+            try { await api("/api/internal-reviews/cancel", { method: "POST", body: JSON.stringify({ scope }) }); }
+            catch (error) { cancel.disabled = false; showError(error); }
+        });
+        actions.append(cancel);
+    } else if (["partial", "cancelled"].includes(review.status) && (coverage.completed_units < coverage.total_units
+        || review.unresolved_findings?.length || review.pending_context_requests)) {
+        const proceed = el("button", "", "Continue review");
+        proceed.type = "button";
+        proceed.addEventListener("click", async () => {
+            proceed.disabled = true;
+            try { await resume(); }
+            catch (error) { proceed.disabled = false; showError(error); }
+        });
+        actions.append(proceed);
+    }
+    if (actions.childNodes.length) container.append(actions);
+    if (review.findings?.length > 8) {
+        const all = el("details", "");
+        all.append(el("summary", "", `All ${review.findings.length} findings`));
+        appendInternalReviewNotice(all, review);
+        const list = el("ul", "");
+        for (const finding of review.findings) {
+            const item = el("li", "");
+            item.append(el("strong", "", `${finding.severity}: ${finding.title}`), document.createTextNode(` ${finding.detail} `));
+            for (const citation of finding.citations) {
+                const open = el("button", "link-button", `${citation.path}:${citation.line}${citation.side === "base" ? " (base)" : ""}`);
+                open.type = "button";
+                open.addEventListener("click", () => openRuleFile(citation.path, [[citation.line]], citation.side));
+                item.append(open, document.createTextNode(" "));
+            }
+            list.append(item);
+        }
+        all.append(list);
+        container.append(all);
+    }
+    if (review.gaps?.length) {
+        const gaps = el("details", "");
+        gaps.append(el("summary", "", countLabel(review.gaps.length, "evidence gap")));
+        const list = el("ul", "");
+        for (const gap of review.gaps) list.append(el("li", "", `${gap.path ? `${gap.path}: ` : ""}${gap.reason}`));
+        gaps.append(list);
+        container.append(gaps);
+    }
+    if (review.unresolved_findings?.length) {
+        const candidates = el("details", "");
+        candidates.append(el("summary", "", `${countLabel(review.unresolved_findings.length, "candidate")} requiring verification`));
+        const list = el("ul", "");
+        for (const finding of review.unresolved_findings) {
+            const item = el("li", "", `${finding.title}: ${finding.detail} `);
+            for (const citation of finding.citations) item.append(sourceReferenceButton(
+                `${citation.path}:${citation.line}${citation.side === "base" ? " (base)" : ""}`,
+                { path: citation.path, lines: [citation.line], side: citation.side }), document.createTextNode(" "));
+            list.append(item);
+        }
+        candidates.append(list);
+        container.append(candidates);
+    }
+}
+
+function appendInternalReviewNotice(container, review) {
+    const { notice } = internalReviewPresentation(review);
+    if (!notice) return;
+    const banner = el("p", "overview-limitation internal-review-notice");
+    banner.setAttribute("role", "status");
+    banner.append(el("strong", "", notice));
+    container.append(banner);
+}
+
+function renderInternalReviewBody(container, review) {
+    container.append(el("h3", "", "Findings"));
+    appendInternalReviewNotice(container, review);
+    if (!review.findings?.length) {
+        container.append(el("p", "", internalReviewPresentation(review).empty));
+        return;
+    }
+    const list = el("ul", "");
+    for (const finding of review.findings.slice(0, 8)) {
+        const item = el("li", "");
+        item.append(el("strong", "", `${finding.severity}: ${finding.title}`), document.createTextNode(" "));
+        item.append(document.createTextNode(finding.detail.length > 320 ? `${finding.detail.slice(0, 319)}… ` : `${finding.detail} `));
+        for (const citation of finding.citations.slice(0, 4)) item.append(sourceReferenceButton(
+            `${citation.path}:${citation.line}${citation.side === "base" ? " (base)" : ""}`,
+            { path: citation.path, lines: [citation.line], side: citation.side }), document.createTextNode(" "));
+        if (finding.detail.length > 320 || finding.citations.length > 4) {
+            const full = el("details", "");
+            full.append(el("summary", "", "Full evidence"), el("p", "", finding.detail));
+            for (const citation of finding.citations) full.append(sourceReferenceButton(
+                `${citation.path}:${citation.line}${citation.side === "base" ? " (base)" : ""}`,
+                { path: citation.path, lines: [citation.line], side: citation.side }), document.createTextNode(" "));
+            item.append(full);
+        }
+        list.append(item);
+    }
+    container.append(list);
+}
+
 function renderRuleCheck() {
     const rules = state.payload?.rule_check;
     if (!rules?.sources?.length) return null;
@@ -847,7 +3622,7 @@ function renderRuleCheck() {
     details.open = state.ruleCheckOpen !== false;
     details.addEventListener("toggle", () => { if (details.isConnected) state.ruleCheckOpen = details.open; });
     const summary = el("summary", "");
-    summary.append(document.createTextNode(`Repository rules · ${rules.sources.map((source) => source.path).join(", ")}`),
+    summary.append(document.createTextNode(`Repository rules · ${rules.sources.length > 3 ? countLabel(rules.sources.length, "instruction file") : rules.sources.map((source) => source.path).join(", ")}`),
         el("span", `custom-status custom-${rules.status}`, rules.status === "unavailable" ? "AI unavailable" : rules.status));
     details.append(summary);
     const sources = el("p", "muted rule-sources");
@@ -857,24 +3632,38 @@ function renderRuleCheck() {
         const open = el("button", "link-button rule-source-link", source.path);
         open.type = "button";
         open.title = ranges.length
-            ? `Open ${source.path} with the ${ranges.length} cited section${ranges.length === 1 ? "" : "s"} highlighted`
+            ? `Open ${source.path} with ${countLabel(ranges.length, "cited section")} highlighted`
             : `Open ${source.path}`;
         open.addEventListener("click", () => openRuleFile(source.path, ranges));
-        sources.append(open, document.createTextNode(` applies to ${source.applicable_count} changed file${
-            source.applicable_count === 1 ? "" : "s"}${source.changed_in_review ? " and was edited in this change" : ""}${source.truncated ? " (truncated)" : ""}${
-            ranges.length ? ` · ${ranges.length} cited section${ranges.length === 1 ? "" : "s"}` : ""}`));
+        sources.append(open, document.createTextNode(` applies to ${countLabel(source.applicable_count, "changed file")}${
+            source.changed_in_review ? " and was edited in this change" : ""}${source.truncated ? " (truncated)" : ""}${
+            ranges.length ? ` · ${countLabel(ranges.length, "cited section")}` : ""}`));
     });
     sources.append(document.createTextNode(". Copilot checks the change against these rules; verify its claims."));
     details.append(sources);
-    if (rules.status === "running") details.append(aiPlaceholder("rule-check", "Copilot is checking the change against the repository rules…", 3));
-    if (rules.content) {
+    appendInternalReview(details, rules, "rules", () => api("/api/rule-check", {
+        method: "POST", body: JSON.stringify({ force: false }),
+    }));
+    if (rules.status === "running" && !rules.coverage) details.append(aiPlaceholder("rule-check", "Copilot is checking the change against the repository rules…", 3));
+    if (rules.content || rules.coverage) {
         markdownContext.subject = null;
         markdownContext.intent = null;
         const body = revealOnce(el("div", "annotation-body"), "rule-check");
-        renderMarkdown(body, rules.content);
+        if (rules.coverage) renderInternalReviewBody(body, rules);
+        else renderMarkdown(body, rules.content);
         details.append(body);
     }
-    if (rules.error) details.append(el("p", "error", rules.error));
+    if (rules.error) {
+        details.append(el("p", "error", rules.error));
+        const retry = el("button", "btn", "Run again");
+        retry.type = "button";
+        retry.addEventListener("click", async () => {
+            retry.disabled = true;
+            try { await api("/api/rule-check", { method: "POST", body: JSON.stringify({ force: true }) }); }
+            catch (error) { retry.disabled = false; showError(error); }
+        });
+        details.append(retry);
+    }
     return details;
 }
 
@@ -925,30 +3714,58 @@ function clearSelection() {
     state.areaGroup = null;
     markSelectedCards();
     renderEmptyDetail();
+    setDetailVisible(false);
 }
 
 function setDetailVisible(visible) {
+    const restoreFocus = !visible && matchMedia("(max-width: 900px)").matches
+        && elements.detail.querySelector(".analysis-adapter-unavailable")
+        && elements.detail.parentElement.contains(document.activeElement);
     state.detailVisible = visible;
     document.querySelector(".workspace").classList.toggle("detail-collapsed", !visible);
     elements.detail_toggle.textContent = visible ? "Hide details" : "Show details";
     elements.detail_toggle.setAttribute("aria-pressed", String(visible));
-    scheduleResizeRender();
+    if (restoreFocus) elements.detail_toggle.focus({ preventScroll: true });
+    detectHostResize();
 }
 
-async function loadSource(query, epoch, preferredTab = null, nav = "reset", extras = {}) {
+async function loadSource(query, epoch, preferredTab = null, nav = "push", extras = {}, { preserveContext = false } = {}) {
     const source = await api(`/api/source?${query}`);
-    const attribution = await fetchAttribution(source.path);
     if (epoch !== state.selectionEpoch) return false;
-    state.source = { ...source, ...extras };
+    const attribution = await fetchAttribution(source.path, epoch);
+    if (epoch !== state.selectionEpoch) return false;
+    const side = elements.source_panel.querySelector(".source-side");
+    const contextScroll = preserveContext ? { top: side.scrollTop, left: side.scrollLeft } : null;
+    state.source = { ...source, ...extras, reviewItem: state.selected };
+    if (!preserveContext) state.readingPane = "code";
     state.attribution = attribution;
     state.sourceTab = source.declaration_highlight?.side === "base" ? "base"
         : preferredTab || (source.diff ? "diff" : "current");
     recordSourceNavigation(nav, { query, extras, tab: state.sourceTab, label: `${source.path}${source.start_line ? `:${source.start_line}` : ""}` });
-    renderSource();
-    const side = elements.source_panel.querySelector(".source-side");
-    side.scrollTop = 0;
-    side.scrollLeft = 0;
+    if (!await renderSource() || epoch !== state.selectionEpoch) return false;
+    if (state.clientError) {
+        state.clientError = null;
+        if (!state.payload?.error) elements.error.classList.add("hidden");
+    }
+    if (contextScroll) {
+        side.scrollTop = contextScroll.top;
+        side.scrollLeft = contextScroll.left;
+    } else {
+        side.scrollTop = 0;
+        side.scrollLeft = 0;
+    }
     return true;
+}
+
+function rememberCurrentSource() {
+    const entry = state.sourceHistory.entries[state.sourceHistory.index];
+    if (!entry || !state.source || elements.source_panel.classList.contains("hidden")) return;
+    entry.reading = {
+        source: state.source, selected: state.source.reviewItem, tab: state.sourceTab,
+        pane: state.readingPane, discussion: state.discussionMode, group: state.activeReviewGroup,
+        attribution: state.attribution, attributionStatus: state.attributionStatus, attributionMessage: state.attributionMessage,
+        scroll: { ...sourceScrollPosition(), side: elements.source_panel.querySelector(".source-side").scrollTop },
+    };
 }
 
 function recordSourceNavigation(mode, entry) {
@@ -983,26 +3800,55 @@ async function navigateSource(delta) {
     const target = history.index + delta;
     const entry = history.entries[target];
     if (!entry) return;
+    rememberCurrentSource();
     history.pending = target;
     const epoch = ++state.selectionEpoch;
     try {
-        await loadSource(entry.query, epoch, entry.tab, "replay", entry.extras || {});
+        if (!entry.reading) {
+            await loadSource(entry.query, epoch, entry.tab, "replay", entry.extras || {});
+            return;
+        }
+        const saved = entry.reading;
+        state.source = saved.source;
+        state.selected = saved.selected;
+        state.sourceTab = saved.tab;
+        state.readingPane = saved.pane;
+        state.activeReviewGroup = saved.group;
+        state.attribution = saved.attribution;
+        state.attributionStatus = saved.attributionStatus;
+        state.attributionMessage = saved.attributionMessage;
+        history.index = target;
+        history.pending = -1;
+        setDiscussionMode(Boolean(saved.discussion));
+        render();
+        if (!await renderSource() || epoch !== state.selectionEpoch) return;
+        if (saved.discussion && saved.selected) {
+            await discussionPane.open(saved.selected, state.payload.review_generation);
+            if (epoch !== state.selectionEpoch) return;
+        }
+        elements.source.scrollTop = saved.scroll.top;
+        elements.source.scrollLeft = saved.scroll.left;
+        elements.source_panel.querySelector(".source-side").scrollTop = saved.scroll.side;
     } catch (error) {
         if (epoch === state.selectionEpoch) showError(error);
     }
 }
 
-async function fetchAttribution(path) {
+async function fetchAttribution(path, epoch = state.selectionEpoch) {
     if (!path) return [];
     try {
         const provenance = await api(`/api/attribution?path=${encodeURIComponent(path)}`);
-        state.attributionStatus = provenance.status || "matched";
-        state.attributionMessage = provenance.message || "";
+        if (epoch === state.selectionEpoch) {
+            state.attributionStatus = provenance.status || "matched";
+            state.attributionMessage = provenance.message || "";
+        }
         return provenance.attribution || [];
     } catch (error) {
         if (error.status !== 404) throw error;
-        state.attributionStatus = "no_match";
-        state.attributionMessage = "No originating prompt was found.";
+        if (epoch === state.selectionEpoch) {
+            state.attributionStatus = "no_match";
+            state.attributionMessage = "No originating prompt was found.";
+        }
         return [];
     }
 }
@@ -1015,7 +3861,11 @@ async function refreshAttribution() {
     state.attribution = await fetchAttribution(state.source.path);
 }
 
-async function selectFile(change) {
+async function selectFile(change, annotate = true) {
+    rememberSourceOrigin();
+    rememberCurrentSource();
+    rememberSourceReturnFocus();
+    setDiscussionMode(false);
     const epoch = ++state.selectionEpoch;
     state.selected = {
         id: `file:${change.path}`, kind: "file", name: change.path, path: change.path,
@@ -1030,14 +3880,29 @@ async function selectFile(change) {
     setDetailVisible(false);
     try {
         if (await loadSource(`path=${encodeURIComponent(change.path)}`, epoch)) {
-            ensureAnnotation(state.selected, epoch);
+            if (annotate) ensureAnnotation(state.selected, epoch);
         }
     } catch (error) {
         if (epoch === state.selectionEpoch) showError(error);
     }
 }
 
-async function selectItem(item, notify = true) {
+// True while the user has not moved on from the control that opened an async load, even if a re-render replaced that control.
+function focusStillAtOpener(opener) {
+    const active = document.activeElement;
+    if (active === opener || !active || active === document.body) return true;
+    if (opener?.isConnected !== false) return false;
+    return active.tagName === opener.tagName && active.className === opener.className
+        && (opener.dataset.reviewId ? active.dataset.reviewId === opener.dataset.reviewId : active.textContent === opener.textContent);
+}
+
+async function selectItem(item, notify = true, annotate = true) {
+    rememberSourceOrigin();
+    rememberCurrentSource();
+    const sourceOpener = document.activeElement;
+    const keepSourceFocus = elements.source_panel.contains(sourceOpener);
+    rememberSourceReturnFocus();
+    if (state.selected?.id !== item.id) setDiscussionMode(false);
     const epoch = ++state.selectionEpoch;
     state.selected = item;
     markSelectedCards();
@@ -1056,9 +3921,16 @@ async function selectItem(item, notify = true) {
             elements.source_panel.classList.add("hidden");
             if (!String(error.message).includes("has no source location")) showError(error);
         }
+    } else {
+        state.source = null;
+        elements.source_panel.classList.add("hidden");
     }
     if (epoch !== state.selectionEpoch) return;
-    if (item.path || item.evidence_ids?.length || item.node_id || item.edge_id) {
+    if (keepSourceFocus || focusStillAtOpener(sourceOpener)) {
+        const target = elements.source_panel.classList.contains("hidden") ? state.sourceReturnFocus : elements.source;
+        target?.focus({ preventScroll: true });
+    }
+    if (annotate && (item.path || item.evidence_ids?.length || item.node_id || item.edge_id)) {
         ensureAnnotation(item, epoch);
     } else {
         renderAnnotation(item, state.payload?.annotations?.[item.id] || null);
@@ -1067,25 +3939,30 @@ async function selectItem(item, notify = true) {
 
 function ensureAnnotation(item, epoch = state.selectionEpoch) {
     if (epoch !== state.selectionEpoch || state.selected?.id !== item.id) return;
+    const generation = state.payload.review_generation;
     const cached = state.payload?.annotations?.[item.id];
     if (cached) {
+        if (state.prefetchStatus?.id === item.id) {
+            state.prefetchStatus = null;
+            renderPrefetchStatus();
+        }
         renderAnnotation(item, cached);
         return;
     }
     renderAnnotation(item, null, true);
-    api("/api/annotation", {
-        method: "POST",
-        body: JSON.stringify({ id: item.id, evidence_ids: item.evidence_ids || [] }),
-    })
-        .then(({ annotation }) => {
-            if (epoch === state.selectionEpoch && state.selected?.id === item.id) {
-                state.payload.annotations ||= {};
-                state.payload.annotations[item.id] = annotation;
+    requestAnnotation(item)
+        .then((annotation) => {
+            if (state.payload?.review_generation === generation && epoch === state.selectionEpoch && state.selected?.id === item.id) {
                 renderAnnotation(item, annotation);
+            }
+            if (state.payload?.review_generation === generation && state.prefetchStatus?.id === item.id) {
+                state.prefetchStatus = null;
+                renderPrefetchStatus();
             }
         })
         .catch((error) => {
-            if (epoch === state.selectionEpoch && state.selected?.id === item.id) renderAnnotation(item, { error: error.message });
+            if (state.payload?.review_generation === generation && epoch === state.selectionEpoch
+                && state.selected?.id === item.id) renderAnnotation(item, { error: error.message });
         });
 }
 
@@ -1125,6 +4002,8 @@ function renderProvenance() {
         panel.append(el("p", className, text));
     };
     panel.classList.remove("provenance-compact");
+    elements.source_origin.classList.toggle("hidden", !state.attribution.length && !state.attributionStatus);
+    if (state.attributionStatus === "error") elements.source_origin.open = true;
     if (!state.attribution.length && state.attributionStatus === "loading") {
         note(state.attributionMessage || "Searching same-repository Copilot sessions…");
         return;
@@ -1159,13 +4038,17 @@ function renderProvenance() {
 }
 
 async function openSessionHistory(attribution) {
+    const restoreFocus = captureReturnFocus();
+    const epoch = state.selectionEpoch;
     try {
         const history = await api(`/api/session-history?session_id=${encodeURIComponent(attribution.session_id)}`);
+        if (epoch !== state.selectionEpoch) return;
         state.highlightedPromptEventId = attribution.prompt_event_id;
+        state.sessionHistoryReturnFocus = restoreFocus;
         elements.session_history_title.textContent = history.summary || "Session transcript";
         elements.session_history_meta.textContent = [
             history.working_directory,
-            `${history.timeline.length} visible events`,
+            countLabel(history.timeline.length, "visible event"),
         ].filter(Boolean).join(" · ");
         const fragment = document.createDocumentFragment();
         let highlighted = null;
@@ -1177,8 +4060,8 @@ async function openSessionHistory(attribution) {
             const edits = tools.filter((tool) => tool.operation === "write").length;
             const group = el("details", "history-tools");
             group.append(el("summary", "", [
-                `${tools.length} tool call${tools.length === 1 ? "" : "s"}`,
-                edits ? `${edits} edit${edits === 1 ? "" : "s"}` : null,
+                countLabel(tools.length, "tool call"),
+                edits ? countLabel(edits, "edit") : null,
                 [...counts].map(([name, count]) => `${name}×${count}`).join(", "),
             ].filter(Boolean).join(" · ")));
             const list = el("ul", "");
@@ -1219,34 +4102,38 @@ async function openSessionHistory(attribution) {
         flushTools();
         elements.session_transcript.replaceChildren(fragment);
         elements.session_history_panel.classList.remove("hidden");
+        elements.session_history_close.focus({ preventScroll: true });
         requestAnimationFrame(() => highlighted?.scrollIntoView({ block: "center" }));
     } catch (error) {
         showError(error);
     }
 }
 
-function appendInlineMarkdown(container, text) {
+function appendInlineMarkdown(container, text, options = {}) {
     const pattern = /(\*\*[^*]+\*\*|`[^`]+`)/g;
     let offset = 0;
     for (const match of text.matchAll(pattern)) {
-        if (match.index > offset) appendTextWithSourceReferences(container, text.slice(offset, match.index));
+        if (match.index > offset) {
+            if (options.sourceReferences === false) container.append(document.createTextNode(text.slice(offset, match.index)));
+            else appendTextWithSourceReferences(container, text.slice(offset, match.index));
+        }
         const token = match[0];
         if (token.startsWith("**")) {
             const label = token.slice(2, -2);
             const intent = markdownContext.intent;
-            if (intent?.session_id && /^(Stated intent|Requested):?$/i.test(label.trim())) {
+            if (options.sourceReferences !== false && intent?.session_id && /^(Stated intent|Requested):?$/i.test(label.trim())) {
                 container.append(intentLink(label, intent));
             } else {
                 const strong = el("strong", "");
-                appendInlineMarkdown(strong, label);
+                appendInlineMarkdown(strong, label, options);
                 container.append(strong);
             }
         } else {
             const value = token.slice(1, -1);
-            const reference = parseSourceReference(value);
-            const symbol = reference ? null : resolveSymbolReference(state.payload?.model, value, markdownContext.subject);
+            const reference = options.sourceReferences === false ? null : parseSourceReference(value);
+            const symbol = options.sourceReferences === false || reference ? null : resolveSymbolReference(state.payload?.model, value, markdownContext.subject);
             if (reference) {
-                container.append(sourceReferenceButton(value, reference));
+                container.append(sourceReferenceButton(sourceReferenceLabel(reference), reference));
             } else if (symbol) {
                 container.append(sourceReferenceButton(value, {
                     path: symbol.path,
@@ -1258,11 +4145,14 @@ function appendInlineMarkdown(container, text) {
         }
         offset = match.index + token.length;
     }
-    if (offset < text.length) appendTextWithSourceReferences(container, text.slice(offset));
+    if (offset < text.length) {
+        if (options.sourceReferences === false) container.append(document.createTextNode(text.slice(offset)));
+        else appendTextWithSourceReferences(container, text.slice(offset));
+    }
 }
 
 function parseSourceReference(value) {
-    return resolveSourceReference(value, state.payload?.model);
+    return resolveSourceReference(value, state.payload?.model, markdownContext.subject?.path);
 }
 
 const markdownContext = { intent: null, subject: null };
@@ -1276,74 +4166,151 @@ function intentLink(label, attribution) {
     return button;
 }
 
+// Links show the repository-relative path and lines, whatever form the text used (absolute, backslashes, bare name).
+function sourceReferenceLabel(reference) {
+    const ranges = [];
+    for (const line of reference.lines || []) {
+        const last = ranges.at(-1);
+        if (last && line === last[1] + 1) last[1] = line;
+        else ranges.push([line, line]);
+    }
+    return `${reference.side ? `${reference.side}:` : ""}${reference.path}${ranges.length ? `:${ranges.map(([from, to]) => from === to ? from : `${from}-${to}`).join(",")}` : ""}`;
+}
+
 function sourceReferenceButton(label, reference, title = null) {
     const button = el("button", "source-reference", label);
     button.type = "button";
     button.title = title || (reference.lines.length
         ? `Open ${reference.path} at line ${reference.lines.join(", ")}`
         : `Open ${reference.path}`);
-    button.addEventListener("click", async () => {
-        const epoch = ++state.selectionEpoch;
-        const query = new URLSearchParams({ path: reference.path });
-        if (reference.lines[0]) query.set("line", String(reference.lines[0]));
-        if (reference.side) query.set("side", reference.side);
-        const packageName = reference.packageName || (state.selected?.id?.startsWith("package:")
-            && [...(state.selected.declared_current || []), ...(state.selected.declared_base || [])].some((item) => item.source === reference.path)
-            ? state.selected.name : null);
-        if (packageName) {
-            query.set("package", packageName);
-            if (state.selected?.ecosystem) query.set("ecosystem", state.selected.ecosystem);
-        }
-        try {
-            await loadSource(query.toString(), epoch, reference.side || "current", "push");
-        } catch (error) {
-            if (epoch === state.selectionEpoch) showError(error);
-        }
-    });
+    button.addEventListener("click", () => openSourceReference(reference).catch(showError));
     return button;
 }
 
+async function openSourceReference(reference, { focus = false, tab = reference.side || "current", nav = "push" } = {}) {
+    rememberSourceOrigin({ overview: true });
+    rememberCurrentSource();
+    rememberSourceReturnFocus();
+    const epoch = ++state.selectionEpoch;
+    const query = new URLSearchParams({ path: reference.path });
+    if (reference.lines[0]) query.set("line", String(reference.lines[0]));
+    if (reference.side) query.set("side", reference.side);
+    const packageName = reference.packageName || (state.selected?.id?.startsWith("package:")
+        && [...(state.selected.declared_current || []), ...(state.selected.declared_base || [])].some((item) => item.source === reference.path)
+        ? state.selected.name : null);
+    if (packageName) {
+        query.set("package", packageName);
+        if (state.selected?.ecosystem) query.set("ecosystem", state.selected.ecosystem);
+    }
+    try {
+        const loaded = await loadSource(query.toString(), epoch, tab, nav);
+        if (loaded && focus) elements.source.focus({ preventScroll: true });
+        return loaded;
+    } catch (error) {
+        if (epoch === state.selectionEpoch) throw error;
+        return false;
+    }
+}
+
 function appendTextWithSourceReferences(container, text) {
-    const pattern = /((?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.(?:csproj|cs|slnx?|props|targets|py|toml|txt|json|ya?ml|md|[cm]?[jt]sx?|css|html)(?![A-Za-z0-9_])(?::\d+(?:-\d+)?(?:,\d+(?:-\d+)*)*)?)/g;
     let offset = 0;
-    for (const match of text.matchAll(pattern)) {
-        if (match.index > offset) container.append(document.createTextNode(text.slice(offset, match.index)));
-        const reference = parseSourceReference(match[0]);
-        container.append(reference ? sourceReferenceButton(match[0], reference) : document.createTextNode(match[0]));
-        offset = match.index + match[0].length;
+    for (const { start, end, reference } of sourceReferencesInText(text, state.payload?.model, markdownContext.subject?.path)) {
+        if (start > offset) container.append(document.createTextNode(text.slice(offset, start)));
+        container.append(sourceReferenceButton(sourceReferenceLabel(reference), reference));
+        offset = end;
     }
     if (offset < text.length) container.append(document.createTextNode(text.slice(offset)));
 }
 
-function renderMarkdown(container, markdown) {
+function renderMarkdown(container, markdown, options = {}) {
     const lines = String(markdown || "").replace(/\r\n/g, "\n").split("\n");
     let list = null;
     let paragraph = [];
+    let fenced = null;
     const flushParagraph = () => {
         if (!paragraph.length) return;
         const node = el("p", "");
-        appendInlineMarkdown(node, paragraph.join(" "));
+        appendInlineMarkdown(node, paragraph.join(" "), options);
         container.append(node);
         paragraph = [];
     };
     const flushList = () => {
         list = null;
     };
-    for (const rawLine of lines) {
+    const tableCells = (line) => line.replace(/^\|/, "").replace(/\|$/, "").split(/(?<!\\)\|/).map((cell) => cell.trim().replace(/\\\|/g, "|"));
+    const tableSeparator = /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?$/;
+    for (let index = 0; index < lines.length; index++) {
+        const rawLine = lines[index];
         const line = rawLine.trim();
+        if (line.startsWith("```")) {
+            flushParagraph();
+            flushList();
+            if (fenced === null) fenced = [];
+            else {
+                const pre = el("pre", "");
+                pre.append(el("code", "", fenced.join("\n")));
+                container.append(pre);
+                fenced = null;
+            }
+            continue;
+        }
+        if (fenced !== null) { fenced.push(rawLine); continue; }
         if (!line) {
             flushParagraph();
+            if (fenced !== null) {
+                const pre = el("pre", "");
+                pre.append(el("code", "", fenced.join("\n")));
+                container.append(pre);
+            }
             flushList();
             continue;
         }
-        if (/^[-*]\s+/.test(line)) {
+        if (line.startsWith("|") && tableSeparator.test(lines[index + 1]?.trim() || "")) {
             flushParagraph();
-            if (!list) {
-                list = el("ul", "");
+            flushList();
+            const header = tableCells(line);
+            const wrap = el("div", "markdown-table-wrap");
+            const table = el("table", "markdown-table");
+            const head = el("tr", "");
+            for (const cell of header) {
+                const th = el("th", "");
+                appendInlineMarkdown(th, cell, options);
+                head.append(th);
+            }
+            const thead = el("thead", "");
+            thead.append(head);
+            const tbody = el("tbody", "");
+            index += 2;
+            for (; index < lines.length && lines[index].trim().startsWith("|"); index++) {
+                const row = el("tr", "");
+                const cells = tableCells(lines[index].trim());
+                for (let column = 0; column < header.length; column++) {
+                    const td = el("td", "");
+                    appendInlineMarkdown(td, cells[column] || "", options);
+                    row.append(td);
+                }
+                tbody.append(row);
+            }
+            index--;
+            table.append(thead, tbody);
+            wrap.append(table);
+            container.append(wrap);
+            continue;
+        }
+        const listItem = /^(?:[-*]|\d+[.)])\s+(.+)$/.exec(line);
+        if (listItem) {
+            flushParagraph();
+            const tag = /^\d/.test(line) ? "ol" : "ul";
+            if (!list || list.tagName.toLowerCase() !== tag) {
+                list = el(tag, "");
+                if (tag === "ol") {
+                    const start = Number(/^\d+/.exec(line)[0]);
+                    if (Number.isSafeInteger(start) && start <= 2147483647) list.start = start;
+                }
                 container.append(list);
             }
             const item = el("li", "");
-            appendInlineMarkdown(item, line.replace(/^[-*]\s+/, ""));
+            appendInlineMarkdown(item, listItem[1], options);
             list.append(item);
             continue;
         }
@@ -1352,7 +4319,7 @@ function renderMarkdown(container, markdown) {
             flushList();
             const level = Math.min(3, line.match(/^#+/)[0].length);
             const heading = el(`h${level}`, "");
-            appendInlineMarkdown(heading, line.replace(/^#{1,3}\s+/, ""));
+            appendInlineMarkdown(heading, line.replace(/^#{1,3}\s+/, ""), options);
             container.append(heading);
             continue;
         }
@@ -1374,12 +4341,86 @@ function extractRisk(body) {
 
 function renderAnnotation(item, annotation, loading = false) {
     const panel = elements.source_annotation;
-    panel.replaceChildren();
-    if (!item || (!loading && !annotation)) {
-        panel.classList.add("hidden");
-        return;
+    const side = panel.closest(".source-side");
+    const generation = state.payload?.review_generation;
+    if (state.annotationGeneration !== generation) {
+        state.annotationDisclosures.clear();
+        state.annotationView = null;
+        state.annotationGeneration = generation;
     }
-    panel.classList.remove("hidden");
+    rememberAnnotationDisclosures();
+    const previous = state.annotationView;
+    const sameItem = previous?.id === item?.id && previous?.generation === generation
+        && previous?.root?.parentNode === panel;
+    const scroll = sameItem && side ? { top: side.scrollTop, left: side.scrollLeft } : null;
+    const active = panel.contains(document.activeElement) ? document.activeElement : null;
+    const focusKey = sameItem ? active?.dataset.annotationFocus : null;
+    // The source model is immutable within a review generation; attribution can arrive later.
+    const key = JSON.stringify([generation, item?.id, item?.title || item?.name, item?.node_id, loading,
+        Boolean(annotation), annotation?.body, annotation?.error, annotation?.evidence_ids, state.attribution?.[0]]);
+    panel.classList.toggle("hidden", !item || (!loading && !annotation));
+    renderReviewContext();
+    if (!sameItem || previous.key !== key) {
+        renderAnnotationContent(item, annotation, loading);
+        const counts = new Map();
+        for (const control of panel.querySelectorAll("summary, button, a")) {
+            const identity = JSON.stringify([control.tagName, control.className,
+                control.tagName === "SUMMARY" ? control.parentElement.dataset.annotationDisclosure
+                    : control.title || control.getAttribute("aria-label") || control.textContent]);
+            const occurrence = counts.get(identity) || 0;
+            counts.set(identity, occurrence + 1);
+            control.dataset.annotationFocus = `${identity}:${occurrence}`;
+        }
+        state.annotationView = { id: item?.id, generation, key, root: panel.firstChild };
+        if (focusKey && (!document.activeElement || document.activeElement === document.body || panel.contains(document.activeElement))) {
+            const target = [...panel.querySelectorAll("[data-annotation-focus]")]
+                .find((control) => control.dataset.annotationFocus === focusKey)
+                || panel.querySelector("summary") || panel.querySelector(".annotation-deepen, button");
+            if (target) target.focus({ preventScroll: true });
+            else if (panel.firstElementChild) {
+                panel.firstElementChild.dataset.annotationFocus = "heading";
+                panel.firstElementChild.tabIndex = -1;
+                panel.firstElementChild.focus({ preventScroll: true });
+            }
+        }
+    }
+    if (scroll) {
+        side.scrollTop = scroll.top;
+        side.scrollLeft = scroll.left;
+    }
+}
+
+function rememberAnnotationDisclosures() {
+    const view = state.annotationView;
+    if (!view || view.generation !== state.payload?.review_generation
+        || view.root?.parentNode !== elements.source_annotation) return;
+    const saved = state.annotationDisclosures.get(view.id) || {};
+    for (const details of elements.source_annotation.querySelectorAll("details[data-annotation-disclosure]")) {
+        saved[details.dataset.annotationDisclosure] = details.open;
+    }
+    state.annotationDisclosures.set(view.id, saved);
+}
+
+function annotationDisclosure(item, name, className, label) {
+    const details = el("details", className);
+    const generation = state.payload?.review_generation;
+    details.dataset.annotationDisclosure = name;
+    details.open = Boolean(state.annotationDisclosures.get(item.id)?.[name]);
+    details.append(el("summary", "", label));
+    details.addEventListener("toggle", () => {
+        if (!details.isConnected || state.payload?.review_generation !== generation
+            || state.annotationView?.id !== item.id) return;
+        const saved = state.annotationDisclosures.get(item.id) || {};
+        saved[name] = details.open;
+        state.annotationDisclosures.set(item.id, saved);
+    });
+    return details;
+}
+
+function renderAnnotationContent(item, annotation, loading) {
+    const panel = elements.source_annotation;
+    panel.replaceChildren();
+    if (!item || (!loading && !annotation)) return;
     const heading = el("div", "annotation-heading");
     heading.append(
         el("span", "annotation-mark", "AI"),
@@ -1398,17 +4439,40 @@ function renderAnnotation(item, annotation, loading = false) {
     const risk = extractRisk(annotation.body);
     if (risk) {
         const banner = el("div", `risk-banner risk-banner-${risk.level}`);
-        banner.append(el("b", "", `${risk.level} risk`), el("span", "", risk.reason));
+        const reason = el("span", "");
+        appendInlineMarkdown(reason, risk.reason, { sourceReferences: false });
+        banner.append(el("b", "", `AI assessment: ${risk.level} risk`), reason);
         panel.append(banner);
     }
     const body = revealOnce(el("div", "annotation-body"), `annotation:${item.id}`);
     markdownContext.intent = state.attribution?.[0] || null;
-    markdownContext.subject = state.payload?.model?.nodes.find((node) => node.id === (item.node_id || item.id)) || null;
-    renderMarkdown(body, risk ? risk.body : annotation.body);
+    markdownContext.subject = state.payload?.model?.nodes.find((node) => node.id === (item.node_id || item.id)) || (item.path ? item : null);
+    const markdown = risk ? risk.body : annotation.body;
+    const { preamble, sections } = annotationSections(markdown);
+    const primary = sections.find((section) => /what changed|behavior|summary|findings/i.test(section.title)) || sections[0];
+    if (primary && sections.length > 1) {
+        renderMarkdown(body, primary.text);
+        const more = annotationDisclosure(item, "explanation", "annotation-more", "Full explanation");
+        const full = el("div", "");
+        renderMarkdown(full, [preamble, ...sections.filter((section) => section !== primary).map((section) => section.text)].join("\n"));
+        more.append(full);
+        body.append(more);
+    } else renderMarkdown(body, markdown);
     panel.append(body);
+    const deepen = el("button", "link-button annotation-deepen", "Ask for a deeper walkthrough");
+    deepen.type = "button";
+    deepen.addEventListener("click", async () => {
+        try {
+            await discussItem(item);
+            if (discussionPane.item?.id !== item.id || state.selected?.id !== item.id) return;
+            discussionPane.prefill(state.source?.path?.toLowerCase().endsWith(".md")
+                ? "Explain the before/after obligations, evidence requirements, required stops, permissions and exceptions. Show how this document reaches an agent, cite both saved versions, and distinguish interpretation from observed behavior."
+                : "Walk through this change step by step: explain before/after control flow, precedence and fallbacks, a concrete input/output example, affected consumers, and what the saved tests do or do not establish. Cite the saved code.");
+        } catch (error) { showError(error); }
+    });
+    panel.append(deepen);
     if (annotation.evidence_ids?.length) {
-        const citations = el("details", "annotation-citations");
-        citations.append(el("summary", "", `Evidence (${annotation.evidence_ids.length})`));
+        const citations = annotationDisclosure(item, "evidence", "annotation-citations", `Evidence (${annotation.evidence_ids.length})`);
         const list = el("div", "evidence-list");
         list.append(...annotation.evidence_ids.map(evidenceButton));
         citations.append(list);
@@ -1416,28 +4480,57 @@ function renderAnnotation(item, annotation, loading = false) {
     }
 }
 
+const ANALYSIS_NOTE_PAGE = 200;
+
 function analysisWarningList(warnings) {
     const list = el("ul", "analysis-warning-list");
-    for (const warning of warnings) {
-        const note = describeAnalysisWarning(warning, state.payload?.model);
-        const row = el("li", "analysis-warning-item");
-        const heading = el("div", "analysis-warning-heading");
-        heading.append(el("strong", "", note.kind));
-        if (note.subject) heading.append(el("code", "inline-code", note.subject));
-        if (note.snapshot) heading.append(el("span", "muted", note.snapshot));
-        if (note.framework) heading.append(el("span", "muted", note.framework));
-        row.append(heading);
-        if (note.reference) row.append(sourceReferenceButton(
-            `${note.reference.path}${note.reference.lines[0] ? `:${note.reference.lines[0]}` : ""}`, note.reference));
-        row.append(el("p", "analysis-warning-explanation", note.explanation || note.message));
-        if (note.explanation) {
-            const details = el("details", "analysis-warning-raw");
-            details.append(el("summary", "", "Analyzer detail"), el("p", "", note.raw));
-            row.append(details);
+    let shown = 0;
+    // Large repositories can carry tens of thousands of notes; render them in pages so opening the list stays instant.
+    const appendPage = () => {
+        list.querySelector(".analysis-warning-more")?.remove();
+        const end = Math.min(warnings.length, shown + ANALYSIS_NOTE_PAGE);
+        for (const warning of warnings.slice(shown, end)) list.append(analysisWarningItem(warning));
+        shown = end;
+        if (shown < warnings.length) {
+            const more = el("li", "analysis-warning-more");
+            const button = el("button", "link-button", `Show ${Math.min(ANALYSIS_NOTE_PAGE, warnings.length - shown).toLocaleString()} more of ${(warnings.length - shown).toLocaleString()} remaining notes`);
+            button.type = "button";
+            button.addEventListener("click", () => {
+                const first = shown;
+                appendPage();
+                list.children[first]?.focus({ preventScroll: false });
+            });
+            more.append(button);
+            list.append(more);
         }
-        list.append(row);
-    }
+    };
+    appendPage();
     return list;
+}
+
+function analysisWarningItem(warning) {
+    const note = describeAnalysisWarning(warning, state.payload?.model);
+    const row = el("li", "analysis-warning-item");
+    const heading = el("div", "analysis-warning-heading");
+    heading.append(el("strong", "", note.kind));
+    if (note.subject) heading.append(el("code", "inline-code", note.subject));
+    if (note.snapshot) heading.append(el("span", "muted", note.snapshot));
+    if (note.framework) heading.append(el("span", "muted", note.framework));
+    row.append(heading);
+    if (note.adapter_unavailable) {
+        row.classList.add("analysis-adapter-unavailable");
+        row.append(el("p", "analysis-warning-explanation", note.message));
+    }
+    if (note.reference) row.append(sourceReferenceButton(
+        `${note.reference.path}${note.reference.lines[0] ? `:${note.reference.lines[0]}` : ""}`, note.reference));
+    row.append(el("p", "analysis-warning-explanation", note.explanation || note.message));
+    if (note.explanation) {
+        const details = el("details", "analysis-warning-raw");
+        details.append(el("summary", "", "Analyzer detail"), el("p", "", note.raw));
+        row.append(details);
+    }
+    row.tabIndex = -1;
+    return row;
 }
 
 function renderDetail(item) {
@@ -1445,18 +4538,14 @@ function renderDetail(item) {
     const panel = elements.detail;
     panel.replaceChildren();
     const top = el("div", "detail-top");
-    const back = el("button", "link-button detail-back", "← Change brief");
-    back.type = "button";
-    back.addEventListener("click", clearSelection);
     top.append(
-        back,
         el("p", "eyebrow", String(item.kind || item.type || "EVIDENCE").replaceAll("_", " ").toUpperCase()),
         el("h2", "", item.display_name || item.name || item.title || item.id),
     );
     panel.append(top);
     const metrics = item.metrics || {};
     const fields = [
-        field("Impact score", item.impact_score),
+        field("Static priority", item.impact_score != null || item.node_id || item.package_id ? concernPriority(item) : null),
         field("Change", item.change),
         field("Path", item.path),
         field("Lines", item.start_line ? `${item.start_line}–${item.end_line || item.start_line}` : null),
@@ -1468,7 +4557,8 @@ function renderDetail(item) {
         field("Complexity", metrics.complexity_current),
         field("Complexity Δ", metrics.complexity_base != null ? `${metrics.complexity_base} → ${metrics.complexity_current}` : null),
         field("Coverage", metrics.coverage_percent != null ? `${metrics.coverage_percent}%` : null),
-        field("Direct callers", metrics.direct_callers),
+        field("Direct callers", metrics.direct_callers == null ? null : item.relationships_incomplete
+            ? `${metrics.direct_callers} resolved · incomplete` : metrics.direct_callers),
         field("90d churn", metrics.churn_lines_90d),
         field("Base signature", item.signatures?.base || item.signature_base),
         field("Current signature", item.signatures?.current || item.signature_current),
@@ -1496,21 +4586,109 @@ function renderDetail(item) {
     }
 }
 
+const coverageLineCache = new WeakMap();
+
+// Current-side line coverage from the supplied run, keyed by repository path.
+function coverageLines(path) {
+    const model = state.payload?.model;
+    if (!path || !model?.coverage?.available) return null;
+    let byPath = coverageLineCache.get(model);
+    if (!byPath) {
+        byPath = new Map((model.coverage.files || []).map((file) => {
+            const covered = new Set(file.covered_lines || []);
+            const missing = file.missing_lines || (file.executable_lines || []).filter((line) => !covered.has(line));
+            return [file.path, new Map([...[...covered].map((line) => [line, "covered"]), ...missing.map((line) => [line, "uncovered"])])];
+        }));
+        coverageLineCache.set(model, byPath);
+    }
+    return byPath.get(path) || null;
+}
+
+function renderSourceCoverage() {
+    const panel = elements.source_coverage;
+    const path = state.source?.path;
+    const lines = coverageLines(path);
+    const changed = state.payload?.model?.coverage?.changed_lines?.[path];
+    state.sourceStripCoverage = null;
+    if (!lines?.size || state.sourceTab === "base") { panel.classList.add("hidden"); renderSourceStrip(); return; }
+    state.sourceStripCoverage = changed?.total ? { covered: changed.covered, total: changed.total } : { supplied: true };
+    panel.replaceChildren(
+        el("strong", "", "Line coverage"),
+        el("span", "coverage-key coverage-key-covered", "executed"),
+        el("span", "coverage-key coverage-key-uncovered", "not executed"),
+        el("span", "muted", changed?.total
+            ? `${changed.covered} of ${countLabel(changed.total, "changed executable line")} executed${changed.uncovered_lines?.length
+                ? ` · not executed: ${changed.uncovered_lines.slice(0, 12).join(", ")}${changed.uncovered_lines.length > 12 ? "…" : ""}` : ""} · supplied run, current side; not proof of named tests.`
+            : "Supplied run, current side; not proof of named tests."));
+    panel.classList.remove("hidden");
+    renderSourceStrip();
+}
+
+// One line above the code summarizes the concern, its static priority, triage and coverage; the full cards expand below it.
+function renderSourceStrip() {
+    const risk = !elements.source_risk.classList.contains("hidden") ? state.sourceStripRisk : null;
+    const coverage = state.sourceStripCoverage;
+    const show = Boolean(state.source && (risk || coverage));
+    elements.source_strip.classList.toggle("hidden", !show);
+    if (!show) return;
+    const open = Boolean(state.sourceStripOpen);
+    const toggle = elements.source_strip_toggle;
+    toggle.replaceChildren();
+    toggle.setAttribute("aria-expanded", String(open));
+    elements.source_strip_body.classList.toggle("hidden", !open);
+    const parts = [];
+    if (risk) {
+        toggle.append(el("strong", "source-strip-title", risk.title));
+        parts.push(el("span", "source-strip-score", `Static priority ${risk.score}/100`));
+        if (risk.reason) parts.push(el("span", "source-strip-reason", risk.reason));
+        if (risk.triage) parts.push(el("span", "source-strip-triage", `Triage: ${risk.triage}`));
+    }
+    if (coverage) {
+        const summary = el("span", "source-strip-coverage");
+        if (coverage.total) {
+            summary.append(el("span", "coverage-key coverage-key-covered", `${coverage.covered}`),
+                document.createTextNode(` of ${countLabel(coverage.total, "changed line")} executed`));
+            if (coverage.total > coverage.covered) summary.append(document.createTextNode(" · "),
+                el("span", "coverage-key coverage-key-uncovered", `${coverage.total - coverage.covered} not executed`));
+        } else summary.append(el("span", "coverage-key coverage-key-covered", "line coverage supplied"));
+        parts.push(summary);
+    }
+    for (const part of parts) {
+        if (toggle.childNodes.length) toggle.append(el("span", "source-strip-sep", "·"));
+        toggle.append(part);
+    }
+    toggle.append(el("span", "source-strip-more", open ? "Hide details" : risk ? "Details & triage" : "Legend"));
+}
+
 function codeRow(type, oldNumber, newNumber, prefix, content) {
     const row = el("div", `code-row diff-${type}`);
     if (oldNumber) row.dataset.oldLine = String(oldNumber);
     if (newNumber) row.dataset.newLine = String(newNumber);
+    // Split diffs show unchanged context on both sides; the right copy is presentational and mirrors this text.
+    if (splitRendering && type === "context") row.dataset.mirror = content;
+    const coverage = newNumber ? coverageLines(state.source?.path)?.get(Number(newNumber)) : null;
+    const current = el("span", "line-number", newNumber || "");
+    if (coverage) {
+        row.classList.add(`coverage-${coverage}`);
+        current.title = coverage === "covered" ? "Executed in the supplied coverage run" : "Not executed in the supplied coverage run";
+    }
     row.append(
         el("span", "line-number", oldNumber || ""),
-        el("span", "line-number", newNumber || ""),
+        current,
         el("span", "diff-prefix", prefix),
         el("code", "", content),
     );
     return row;
 }
 
-function parseDiff(text) {
-    const rows = [];
+const SPLIT_DIFF_MIN_WIDTH = 1100;
+let splitRendering = false;
+let splitPairCounter = 0;
+const diffLayoutPreference = () => { try { return localStorage.getItem("agent-review.diff-layout") === "split" ? "split" : "unified"; } catch { return "unified"; } };
+// Split needs room for two columns of code; narrower windows always read unified.
+const splitDiffActive = (tab = state.sourceTab) => tab === "diff" && diffLayoutPreference() === "split" && innerWidth >= SPLIT_DIFF_MIN_WIDTH;
+
+function* diffRowIterator(text, split = false) {
     let oldLine = 0;
     let newLine = 0;
     const lines = String(text || "").split(/\r?\n/);
@@ -1528,7 +4706,7 @@ function parseDiff(text) {
                 const header = codeRow("hunk", "", "", "", `Lines ${range}${context ? ` · ${context}` : ""}`);
                 header.dataset.oldStart = String(oldLine);
                 header.dataset.newStart = String(newLine);
-                rows.push(header);
+                yield header;
             }
             index += 1;
             continue;
@@ -1542,45 +4720,56 @@ function parseDiff(text) {
             while (lines[index]?.startsWith("-") && !lines[index].startsWith("---")) removed.push(lines[index++].slice(1));
             const added = [];
             while (lines[index]?.startsWith("+") && !lines[index].startsWith("+++")) added.push(lines[index++].slice(1));
-            const replacement = added.length > 0;
-            for (const content of removed) rows.push(codeRow(replacement ? "modified" : "delete", oldLine++, "", "−", content));
-            for (const content of added) rows.push(codeRow("modified", "", newLine++, "+", content));
+            if (split) {
+                // Pair each removed line with the added line in the same position so edits read side by side.
+                for (let pair = 0; pair < Math.max(removed.length, added.length); pair++) {
+                    const id = `p${++splitPairCounter}`;
+                    if (pair < removed.length) { const row = codeRow("delete", oldLine++, "", "−", removed[pair]); row.dataset.pair = id; yield row; }
+                    if (pair < added.length) { const row = codeRow("add", "", newLine++, "+", added[pair]); row.dataset.pair = id; yield row; }
+                }
+                continue;
+            }
+            for (const content of removed) yield codeRow("delete", oldLine++, "", "−", content);
+            for (const content of added) yield codeRow("add", "", newLine++, "+", content);
             continue;
         } else if (line.startsWith("+")) {
-            rows.push(codeRow("add", "", newLine++, "+", line.slice(1)));
+            const row = codeRow("add", "", newLine++, "+", line.slice(1));
+            if (split) row.dataset.pair = `p${++splitPairCounter}`;
+            yield row;
         } else if (line.startsWith(" ")) {
-            rows.push(codeRow("context", oldLine++, newLine++, " ", line.slice(1)));
+            yield codeRow("context", oldLine++, newLine++, " ", line.slice(1));
         } else if (line) {
-            rows.push(codeRow("meta", "", "", "", line));
+            yield codeRow("meta", "", "", "", line);
         }
         index += 1;
     }
-    return rows;
 }
 
-function renderPlainSource(text, side) {
-    if (text === null || text === undefined) return [];
+function parseDiff(text) {
+    return [...diffRowIterator(text)];
+}
+
+function* plainSourceRows(text, side) {
+    if (text === null || text === undefined) return;
     const segments = diffSegments(state.source?.diff);
     const marks = side === "base" ? segments.base : segments.current;
     const gaps = side === "base" ? segments.addedBefore : segments.removedBefore;
     const gapRow = (count) => {
         const row = codeRow("gap", "", "", side === "base" ? "+" : "−",
-            side === "base" ? `${count} line${count === 1 ? "" : "s"} added here in Current`
-                : `${count} line${count === 1 ? "" : "s"} removed here (see Base)`);
+            side === "base" ? `${countLabel(count, "line")} added here in Current`
+                : `${countLabel(count, "line")} removed here (see Base)`);
         row.classList.add(side === "base" ? "gap-added" : "gap-removed");
         return row;
     };
     const lines = String(text).split(/\r\n|\r|\n/);
-    const rows = [];
-    lines.forEach((line, index) => {
+    for (const [index, line] of lines.entries()) {
         const number = index + 1;
-        if (gaps.has(number)) rows.push(gapRow(gaps.get(number)));
+        if (gaps.has(number)) yield gapRow(gaps.get(number));
         const type = marks.get(number);
-        rows.push(codeRow(type || "context", side === "base" ? number : "", side === "base" ? "" : number,
-            type ? (side === "base" ? "−" : "+") : "", line));
-    });
-    if (gaps.has(lines.length + 1)) rows.push(gapRow(gaps.get(lines.length + 1)));
-    return rows;
+        yield codeRow(type || "context", side === "base" ? number : "", side === "base" ? "" : number,
+            type ? (side === "base" ? "−" : "+") : "", line);
+    }
+    if (gaps.has(lines.length + 1)) yield gapRow(gaps.get(lines.length + 1));
 }
 
 // Unchanged regions between hunks, with matching base/current line numbers for in-place expansion.
@@ -1602,48 +4791,125 @@ function diffGaps(source) {
     }
     if (currentLines.length > newEnd) gaps.push({ before: hunks.length, newFrom: newEnd + 1, newTo: currentLines.length, oldFrom: oldEnd + 1 });
     return gaps.map((gap) => ({ ...gap, key: `${gap.newFrom}-${gap.newTo}`,
-        rows: () => currentLines.slice(gap.newFrom - 1, gap.newTo).map((content, offset) =>
-            codeRow("context", gap.oldFrom + offset, gap.newFrom + offset, " ", content)) }));
+        *iterateRows() {
+            for (let line = gap.newFrom; line <= gap.newTo; line++) {
+                yield codeRow("context", gap.oldFrom + line - gap.newFrom, line, " ", currentLines[line - 1]);
+            }
+        },
+        rows() { return [...this.iterateRows()]; } }));
 }
 
-function gapToggleRow(gap, expanded) {
+function gapToggleRow(gap, expanded, contextRows) {
     const count = gap.newTo - gap.newFrom + 1;
     const row = codeRow("gap-toggle", "", "", expanded ? "▴" : "▾",
-        `${expanded ? "Hide" : "Show"} ${count.toLocaleString()} unchanged line${count === 1 ? "" : "s"} (${gap.newFrom}–${gap.newTo})`);
+        `${expanded ? "Hide" : "Show"} ${countLabel(count, "unchanged line")} (${gap.newFrom}–${gap.newTo})`);
     row.dataset.gap = gap.key;
     row.tabIndex = 0;
     row.setAttribute("role", "button");
     row.setAttribute("aria-expanded", String(expanded));
-    const toggle = () => {
-        const expandedGaps = state.source.expandedGaps ||= new Set();
-        if (expandedGaps.has(gap.key)) expandedGaps.delete(gap.key);
-        else expandedGaps.add(gap.key);
-        renderSource({ preserveScroll: true, focusGap: gap.key });
+    let displayedRows = contextRows;
+    let displayedChunks = [];
+    let toggling = false;
+    const toggle = async () => {
+        if (!row.isConnected || state.sourceTab !== "diff" || toggling) return;
+        const source = state.source;
+        toggling = true;
+        row.setAttribute("aria-busy", "true");
+        try {
+            const previousScroll = { top: elements.source.scrollTop, left: elements.source.scrollLeft };
+            const expandedGaps = state.source.expandedGaps ||= new Set();
+            const expand = !expandedGaps.has(gap.key);
+            if (expand) {
+                const prepared = [];
+                let started = performance.now();
+                for (const context of gap.iterateRows()) {
+                    prepared.push(context);
+                    if (prepared.length % 100 === 0 && performance.now() - started > 8) {
+                        await new Promise((resolve) => setTimeout(resolve, 0));
+                        if (!row.isConnected || state.source !== source || state.sourceTab !== "diff") return;
+                        started = performance.now();
+                    }
+                }
+                const referencedRows = [...elements.source.querySelectorAll(`[data-gap-context="${gap.key}"]`)];
+                referencedRows.forEach((context) => context.remove());
+                displayedRows = prepared;
+                const focusSide = state.source.declaration_highlight?.side || state.source.focus_side
+                    || (state.source.current === null ? "base" : "current");
+                applySourceFocus(displayedRows, Number(state.source.start_line),
+                    Number(state.source.end_line || state.source.start_line), focusSide);
+                applyCitedHighlights(displayedRows);
+                const fragment = document.createDocumentFragment();
+                if (displayedRows.length > 2000) {
+                    for (let offset = 0; offset < displayedRows.length; offset += 100) {
+                        const chunk = el("div", "source-chunk");
+                        chunk.append(...displayedRows.slice(offset, offset + 100));
+                        displayedChunks.push(chunk);
+                        fragment.append(chunk);
+                    }
+                } else fragment.append(...displayedRows);
+                row.after(fragment);
+                expandedGaps.add(gap.key);
+            } else {
+                if (displayedChunks.length) displayedChunks.forEach((chunk) => chunk.remove());
+                else displayedRows.forEach((context) => context.remove());
+                displayedChunks = [];
+                displayedRows = [];
+                const focusSide = state.source.declaration_highlight?.side || state.source.focus_side
+                    || (state.source.current === null ? "base" : "current");
+                const start = Number(state.source.start_line);
+                const context = unchangedDiffContext({ ...state.source, line: start, side: focusSide });
+                if (context?.length && context[0].newLine >= gap.newFrom && context.at(-1).newLine <= gap.newTo) {
+                    const referencedRows = [codeRow("hunk", "", "", "", `Referenced line ${start} · unchanged context`),
+                        ...context.map((item) => codeRow("context", item.oldLine, item.newLine, " ", item.content))];
+                    referencedRows.forEach((item) => { item.dataset.gapContext = gap.key; });
+                    applySourceFocus(referencedRows, start, Number(state.source.end_line || start), focusSide);
+                    applyCitedHighlights(referencedRows);
+                    row.after(...referencedRows);
+                }
+                expandedGaps.delete(gap.key);
+            }
+            row.querySelector(".diff-prefix").textContent = expand ? "▴" : "▾";
+            row.querySelector("code").textContent =
+                `${expand ? "Hide" : "Show"} ${countLabel(count, "unchanged line")} (${gap.newFrom}–${gap.newTo})`;
+            row.setAttribute("aria-expanded", String(expand));
+            renderChangeRuler([...elements.source.querySelectorAll(".code-row")]);
+            elements.source.scrollTop = previousScroll.top;
+            elements.source.scrollLeft = previousScroll.left;
+            row.focus({ preventScroll: true });
+        } finally {
+            toggling = false;
+            row.removeAttribute("aria-busy");
+        }
     };
-    row.addEventListener("click", toggle);
+    row.addEventListener("click", () => toggle().catch(showError));
     row.addEventListener("keydown", (event) => {
         if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            toggle();
+            toggle().catch(showError);
         }
     });
     return row;
 }
 
-function diffRowsWithGaps(source) {
-    const rows = parseDiff(source.diff);
+function diffRowsWithGaps(source, rows) {
     const gaps = diffGaps(source);
     if (!gaps.length) return rows.filter((row) => !row.dataset.newStart);
-    const headers = rows.filter((row) => row.classList.contains("diff-hunk") && row.dataset.newStart);
+    const headers = new Map(rows.filter((row) => row.classList.contains("diff-hunk") && row.dataset.newStart)
+        .map((row, index) => [row, index]));
     const result = [];
     const expandedGaps = source.expandedGaps || new Set();
     const insertGap = (gap) => {
+        if (gap.newTo - gap.newFrom + 1 < 5) {
+            result.push(...gap.rows());
+            return;
+        }
         const expanded = expandedGaps.has(gap.key);
-        result.push(gapToggleRow(gap, expanded), ...(expanded ? gap.rows() : []));
+        const contextRows = expanded ? gap.rows() : [];
+        result.push(gapToggleRow(gap, expanded, contextRows), ...contextRows);
     };
     let gapIndex = 0;
     for (const row of rows) {
-        const hunkIndex = headers.indexOf(row);
+        const hunkIndex = headers.get(row) ?? -1;
         while (hunkIndex >= 0 && gapIndex < gaps.length && gaps[gapIndex].before <= hunkIndex) insertGap(gaps[gapIndex++]);
         if (hunkIndex < 0) result.push(row);
     }
@@ -1651,13 +4917,142 @@ function diffRowsWithGaps(source) {
     return result;
 }
 
-function renderSource({ preserveScroll = false, focusGap = null } = {}) {
+const sourceRowCache = new Map();
+let sourceRenderVersion = 0;
+
+const rowCacheKey = (source, tab) => `${source.path}\0${tab}${splitDiffActive(tab) ? "\0split" : ""}`;
+
+// Wrap each paired removed/added line in one side-by-side unit; every line stays its own .code-row for selection,
+// citations and coverage. Unpaired sides get an empty filler so columns stay aligned.
+function splitDiffUnits(rows) {
+    const units = [];
+    for (let index = 0; index < rows.length; index++) {
+        const row = rows[index];
+        if (!row.dataset?.pair) { units.push(row); continue; }
+        const pair = el("div", "split-pair");
+        const next = rows[index + 1];
+        const partner = next?.dataset?.pair === row.dataset.pair ? next : null;
+        if (partner) index++;
+        const left = row.classList.contains("diff-delete") ? row : null;
+        const right = row.classList.contains("diff-add") ? row : partner;
+        pair.append(left || el("div", "split-filler"), right || el("div", "split-filler"));
+        units.push(pair);
+    }
+    return units;
+}
+
+function renderDiffLayoutControl() {
+    const control = elements.diff_layout;
+    const available = state.sourceTab === "diff" && innerWidth >= SPLIT_DIFF_MIN_WIDTH;
+    control.classList.toggle("hidden", !available);
+    const preference = diffLayoutPreference();
+    for (const button of control.querySelectorAll("button")) button.setAttribute("aria-pressed", String(button.dataset.layout === preference));
+}
+
+function setDiffLayout(layout) {
+    try { localStorage.setItem("agent-review.diff-layout", layout); } catch { /* the choice still applies to this view */ }
+    if (!state.source || state.sourceTab !== "diff") { renderDiffLayoutControl(); return; }
+    rememberReadingLine();
+    renderSource().then(restoreReadingLine).catch(showError);
+}
+
+// Switching layout keeps the reader on the same line instead of jumping to the top.
+function rememberReadingLine() {
+    const viewed = viewedSourceLocation();
+    state.layoutReadingLine = viewed ? { ...viewed } : null;
+}
+
+function restoreReadingLine() {
+    const viewed = state.layoutReadingLine;
+    state.layoutReadingLine = null;
+    if (!viewed) return;
+    const row = elements.source.querySelector(`.code-row[data-${viewed.side === "base" ? "old" : "new"}-line="${viewed.line}"]`);
+    if (row) elements.source.scrollTop += row.getBoundingClientRect().top - elements.source.getBoundingClientRect().top;
+}
+
+function matchingSourceRows(source, tab) {
+    const cached = sourceRowCache.get(rowCacheKey(source, tab));
+    return cached && cached.generation === state.payload?.review_generation && cached.diff === source.diff
+        && cached.text === source[tab] && cached.current === source.current && cached.base === source.base ? cached : null;
+}
+
+async function cachedSourceRows(source, tab, isCurrent) {
+    const key = rowCacheKey(source, tab);
+    const generation = state.payload?.review_generation;
+    const cached = matchingSourceRows(source, tab);
+    if (cached) {
+        sourceRowCache.delete(key);
+        sourceRowCache.set(key, cached);
+        for (const row of new Set([...cached.marked,
+            ...(cached.lines?.querySelectorAll(".focus-line, .cited-line") || [])])) {
+            row.classList.remove("focus-line", "focus-start", "focus-end", "cited-line", "cited-start", "cited-end");
+            const code = row.querySelector("code");
+            if (code?.querySelector("mark")) code.textContent = code.textContent;
+        }
+        cached.marked = [];
+        cached.references?.forEach((row) => row.remove());
+        cached.lines?.querySelectorAll("[data-gap-context]").forEach((row) => row.remove());
+        cached.references = [];
+        source.expandedGaps = cached.expandedGaps;
+        return cached;
+    }
+    const rows = [];
+    const iterator = tab === "diff" ? diffRowIterator(source.diff, splitDiffActive(tab)) : plainSourceRows(source[tab], tab);
+    let started = performance.now();
+    for (const row of iterator) {
+        rows.push(row);
+        if (rows.length % 100 === 0 && performance.now() - started > 8) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            if (!isCurrent()) return null;
+            started = performance.now();
+        }
+    }
+    if (!isCurrent()) return null;
+    const entry = { generation, diff: source.diff, text: source[tab], current: source.current, base: source.base,
+        rows, marked: [], references: [],
+        expandedGaps: source.expandedGaps ||= new Set() };
+    if (rows.length > 60_000) return entry;
+    sourceRowCache.set(key, entry);
+    let total = [...sourceRowCache.values()].reduce((sum, entry) => sum + entry.rows.length, 0);
+    while (sourceRowCache.size > 3 || (total > 60_000 && sourceRowCache.size > 1)) {
+        const first = sourceRowCache.keys().next().value;
+        total -= sourceRowCache.get(first).rows.length;
+        sourceRowCache.delete(first);
+    }
+    return entry;
+}
+
+async function renderSource({ preserveScroll = false } = {}) {
     if (!state.source) return;
+    state.reviewPage = "review";
+    if (!state.readingPane) state.readingPane = "code";
+    elements.source_panel.classList.remove("no-source");
+    const source = state.source;
+    const tab = state.sourceTab;
+    const version = ++sourceRenderVersion;
+    const isCurrent = () => version === sourceRenderVersion && state.source === source && state.sourceTab === tab;
     const previousScroll = { top: elements.source.scrollTop, left: elements.source.scrollLeft };
     elements.source_panel.classList.remove("hidden");
+    renderWorkspaceNavigation();
+    state.navigationCursor = { path: source.path, group: state.activeReviewGroup || null };
+    renderWorkspaceShell();
     elements.source_title.textContent = `${state.source.path}${state.source.start_line ? `:${state.source.start_line}` : ""}`;
-    const text = state.source[state.sourceTab];
-    const rows = state.sourceTab === "diff" ? diffRowsWithGaps(state.source) : renderPlainSource(text, state.sourceTab);
+    elements.source_title.title = elements.source_title.textContent;
+    renderSourcePosition(state.source.path);
+    elements.source_section.classList.toggle("hidden", !(state.payload?.model?.changes || [])
+        .some((change) => change.path === state.source.path && change.status !== "unchanged"));
+    elements.source.setAttribute("aria-busy", "true");
+    elements.source_focus.disabled = !state.sourceFocused;
+    elements.source_location.disabled = true;
+    if (!matchingSourceRows(source, tab)) elements.source.replaceChildren(el("p", "muted", "Rendering saved source…"));
+    elements.source_ruler.classList.add("hidden");
+    splitRendering = splitDiffActive(tab);
+    renderDiffLayoutControl();
+    const cached = await cachedSourceRows(source, tab, isCurrent);
+    if (!cached || !isCurrent()) return false;
+    const reused = Boolean(cached.lines);
+    const rows = reused ? [...cached.lines.querySelectorAll(".code-row")]
+        : tab === "diff" ? diffRowsWithGaps(source, cached.rows) : cached.rows;
     const start = Number(state.source.start_line);
     const focusSide = state.source.declaration_highlight?.side || state.source.focus_side
         || (state.source.current === null ? "base" : "current");
@@ -1671,27 +5066,50 @@ function renderSource({ preserveScroll = false, focusGap = null } = {}) {
             const first = context[0][key];
             const position = rows.findIndex((row) =>
                 Number(row.dataset?.[headerKey]) >= first || Number(row.dataset?.[key]) >= first);
-            rows.splice(position < 0 ? rows.length : position, 0,
+            const referencedRows = [
                 codeRow("hunk", "", "", "", `Referenced line ${start} · unchanged context`),
-                ...context.map((row) => codeRow("context", row.oldLine, row.newLine, " ", row.content)));
+                ...context.map((row) => codeRow("context", row.oldLine, row.newLine, " ", row.content))];
+            const gap = rows.find((row) => {
+                if (!row.dataset.gap) return false;
+                const [from, to] = row.dataset.gap.split("-").map(Number);
+                return context[0].newLine >= from && context.at(-1).newLine <= to;
+            });
+            if (gap) referencedRows.forEach((row) => { row.dataset.gapContext = gap.dataset.gap; });
+            cached.references = referencedRows;
+            if (reused) {
+                if (position < 0) rows.at(-1)?.after(...referencedRows);
+                else rows[position].before(...referencedRows);
+            }
+            rows.splice(position < 0 ? rows.length : position, 0, ...referencedRows);
         } else {
             elements.source_context_notice.textContent = `Referenced line ${start} is not included in this diff. Open ${focusSide === "base" ? "Base" : "Current"} to inspect it.`;
             elements.source_context_notice.classList.remove("hidden");
         }
     }
-    const lines = el("div", "code-lines");
+    const lines = cached.lines || el("div", "code-lines");
     const oldNumbers = rows.some((row) => row.dataset?.oldLine);
     const newNumbers = rows.some((row) => row.dataset?.newLine);
+    elements.source_focus.disabled = !(oldNumbers || newNumbers) && !state.sourceFocused;
+    elements.source_location.disabled = !(oldNumbers || newNumbers);
     lines.classList.toggle("new-lines-only", newNumbers && !oldNumbers);
     lines.classList.toggle("old-lines-only", oldNumbers && !newNumbers);
     const largestLine = rows.reduce((largest, row) =>
         Math.max(largest, Number(row.dataset?.oldLine) || 0, Number(row.dataset?.newLine) || 0), 0);
-    lines.style.setProperty("--source-line-digits", String(Math.max(2, String(largestLine).length)));
-    lines.append(...(rows.length ? rows : [el("p", "empty-code", "(not present in this snapshot)")]));
-    elements.source.replaceChildren(lines);
-    if (!preserveScroll) {
-        elements.source.scrollTop = 0;
-        elements.source.scrollLeft = 0;
+    lines.dataset.lineDigits = String(Math.max(2, String(largestLine).length));
+    lines.style.setProperty("--source-line-digits", lines.dataset.lineDigits);
+    lines.classList.toggle("split-diff", splitRendering);
+    if (!reused) {
+        const units = splitRendering ? splitDiffUnits(rows) : rows;
+        if (units.length > 2000) {
+            const fragment = document.createDocumentFragment();
+            for (let offset = 0; offset < units.length; offset += 100) {
+                const chunk = el("div", "source-chunk");
+                chunk.append(...units.slice(offset, offset + 100));
+                fragment.append(chunk);
+            }
+            lines.append(fragment);
+        } else lines.append(...(units.length ? units : [el("p", "empty-code", "(not present in this snapshot)")]));
+        cached.lines = lines;
     }
     let focusStart = start;
     let focusEnd = Number(state.source.end_line || state.source.start_line);
@@ -1708,8 +5126,588 @@ function renderSource({ preserveScroll = false, focusGap = null } = {}) {
         focusStart = mapLine(start);
         focusEnd = mapLine(focusEnd) || focusStart;
     }
+    const focused = applySourceFocus(rows, focusStart, focusEnd, focusSide);
+    const cited = applyCitedHighlights(rows);
+    cached.marked = [...new Set([...focused, ...cited])];
+    if (elements.source.firstElementChild !== lines) elements.source.replaceChildren(lines);
+    elements.source.removeAttribute("aria-busy");
+    renderChangeRuler(rows);
+    renderSourceComments();
+    const annotation = state.payload?.annotations?.[state.selected?.id];
+    const selectedPath = state.selected?.path || state.payload?.model?.nodes?.find((node) =>
+        node.id === (state.selected?.node_id || state.selected?.id))?.path;
+    if (annotation && selectedPath === state.source.path) renderAnnotation(state.selected, annotation);
+    else if (selectedPath === state.source.path && state.annotationRequests.has(`${state.payload.review_generation}:${state.selected?.id}`)) {
+        renderAnnotation(state.selected, null, true);
+    } else if (!renderSectionEvidence()) elements.source_annotation.classList.add("hidden");
+    renderSourceRisk();
+    renderSourceCoverage();
+    renderSourceDecisions();
+    renderProvenance();
+    document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === state.sourceTab));
+    renderSourceNavigation();
+    renderFileReview();
+    schedulePrefetchNext();
+    if (preserveScroll) {
+        elements.source.scrollTop = previousScroll.top;
+        elements.source.scrollLeft = previousScroll.left;
+    } else {
+        elements.source.scrollTop = 0;
+        elements.source.scrollLeft = 0;
+        const target = focused[0] || cited[0];
+        target?.scrollIntoView({ block: "center" });
+    }
+    queueReviewCursor();
+    return true;
+}
+
+// ---- Per-layer verification: run the linked tests of the layer being read, beside the code ----
+
+const layerPaths = (layer) => [...new Set(layer.groups.flatMap((group) => group.files.map((file) => file.path)))];
+// The deterministic area name labels runs, so the run history reads the same before and after AI step titles load.
+const layerScope = (layer) => ({ id: layer.id, name: layer.name, number: layer.number || null, paths: layerPaths(layer) });
+const layerTests = (layer) => layerTestStatus(state.payload?.decision_map, state.payload?.test_run, layerPaths(layer));
+
+function currentReadingLayer() {
+    const navigation = state.workspaceNavigation;
+    return state.source && navigation ? layerOf(navigation, { path: state.source.path }) : null;
+}
+
+function layerPlanFor(layer) {
+    const payload = state.payload;
+    const key = [payload?.review_generation, Boolean(payload?.worktree_changed), payload?.decision_map?.status, payload?.decision_map?.total_ms, layer.id].join(":");
+    state.layerPlans ||= new Map();
+    const cached = state.layerPlans.get(key);
+    if (cached) return cached.plan;
+    state.layerPlans.set(key, { plan: null });
+    api("/api/test-run/plan", { method: "POST", body: JSON.stringify({ layer: layerScope(layer) }) })
+        .then((plan) => { state.layerPlans.set(key, { plan }); renderReviewContext(); })
+        .catch((error) => { state.layerPlans.set(key, { plan: { available: false, reason: error.message } }); renderReviewContext(); });
+    return null;
+}
+
+function layerTestSummary(status) {
+    if (status.state === "running") return `${countLabel(status.linked, "linked test")} · running${
+        status.ran ? ` (before this run: ${layerTestSummary({ ...status, state: status.outcome })})` : ""}`;
+    if (status.state === "not-run") return `${countLabel(status.linked, "linked test")} · not run`;
+    const parts = ["passed", "failed", "error", "skipped"].filter((key) => status.counts[key]).map((key) => `${status.counts[key]} ${key}`);
+    if (status.counts.not_run) parts.push(`${status.counts.not_run} not run`);
+    return `${parts.join(" · ")}${status.stale ? " · stale" : ""}`;
+}
+
+// A compact status chip for rails and lists; nothing when the layer has no linked tests. Only fresh, all-passing results get a ✓.
+function layerTestChip(layer) {
+    const status = layerTests(layer);
+    if (!["running", "not-run", "passed", "failing", "partial", "skipped"].includes(status.state)) return null;
+    const kind = status.stale && status.state !== "running" ? "stale" : status.state;
+    const text = status.state === "running" ? "Testing…"
+        : status.state === "failing" ? `✗ ${status.counts.failed + status.counts.error} failing`
+        : status.stale ? `${status.ran}/${status.linked} tested · stale`
+        : status.state === "passed" ? `✓ ${status.counts.passed} passed`
+        : status.state === "skipped" ? `${status.counts.passed} passed · ${status.counts.skipped} skipped`
+        : status.state === "partial" ? `${status.ran}/${status.linked} tested` : `${status.linked} tests`;
+    const chip = el("span", `layer-tests layer-tests-${kind}`, text);
+    chip.title = `Linked tests for this layer: ${layerTestSummary(status)}. Run them from "What was verified?" beside the code.`;
+    return chip;
+}
+
+function layerVerifyBlock(layer) {
+    const block = el("div", "layer-verify");
+    block.setAttribute("aria-live", "polite");
+    const status = layerTests(layer);
+    const label = layerLabel(layer);
+    if (status.state === "loading") {
+        block.append(el("p", "muted", `Finding the tests linked to ${label}…`));
+        return block;
+    }
+    if (status.state === "unavailable") {
+        block.append(el("p", "muted", state.payload?.decision_map?.status === "error"
+            ? "Linked tests are unavailable because code-path analysis failed."
+            : "Linked tests are unavailable for this review (no code-path test links)."));
+        return block;
+    }
+    if (status.state === "none") {
+        block.append(el("p", "", state.payload?.decision_map?.limited || state.payload?.decision_map?.verification?.limited
+            ? `No test links were resolved for ${label} in incomplete analysis; omitted callers or tests remain unknown.`
+            : `No linked tests reach the changed code in ${label}.`));
+        return block;
+    }
+    const run = state.payload?.test_run;
+    const plan = layerPlanFor(layer);
+    const head = el("p", "layer-verify-status");
+    head.append(el("strong", "", `${label}: `), layerTestSummary(status));
+    block.append(head);
+    const last = [...(run?.history || [])].reverse().find((entry) => entry.scope?.id === layer.id);
+    if (last && ["error", "cancelled"].includes(last.status) && status.state !== "running") {
+        block.append(el("p", last.status === "error" ? "error" : "muted", last.status === "error"
+            ? `The last run of this layer's tests failed to complete: ${last.error || "see the test output in Explore → Code paths."}` : "The last run of this layer's tests was cancelled."));
+    }
+    const failing = (scopeDecisionMap(state.payload.decision_map, layerPaths(layer)).verification?.tests || [])
+        .filter((test) => ["failed", "error"].includes(linkedTestOutcome(run, test.id)));
+    if (failing.length) {
+        const list = el("ul", "layer-verify-failing");
+        for (const test of failing.slice(0, 5)) {
+            const item = el("li", "");
+            const open = el("button", "link-button", `${test.name} ${linkedTestOutcome(run, test.id)}`);
+            open.type = "button";
+            open.title = `Open ${test.path}:${test.line}`;
+            open.addEventListener("click", async () => {
+                rememberSourceOrigin();
+                rememberCurrentSource();
+                const epoch = ++state.selectionEpoch;
+                try {
+                    if (await loadSource(`path=${encodeURIComponent(test.path)}&line=${test.line}&side=current`, epoch, "current", "push")
+                        && epoch === state.selectionEpoch) elements.source.focus({ preventScroll: true });
+                } catch (error) { if (epoch === state.selectionEpoch) showError(error); }
+            });
+            item.append(open);
+            list.append(item);
+        }
+        block.append(list);
+    }
+    const actions = el("div", "layer-verify-actions");
+    const running = run?.status === "running";
+    const button = el("button", "layer-verify-run", status.state === "running" ? "Running…"
+        : status.state === "not-run" ? `Run ${countLabel(status.linked, "linked test")}` : "Rerun this layer's tests");
+    button.type = "button";
+    button.dataset.focusKey = "run";
+    button.disabled = running || !plan?.available;
+    button.title = plan?.available ? plan.command : plan?.reason || "Checking the linked tests…";
+    button.addEventListener("click", async () => {
+        // Re-renders replace these controls; keep keyboard focus on the equivalent control (Cancel while running).
+        state.layerVerifyFocus = "cancel";
+        button.disabled = true;
+        try { await api("/api/test-run", { method: "POST", body: JSON.stringify({ layer: layerScope(layer) }) }); }
+        catch (error) { state.layerVerifyFocus = null; showError(error); button.disabled = false; }
+    });
+    actions.append(button);
+    if (running) {
+        const cancel = el("button", "link-button", "Cancel");
+        cancel.type = "button";
+        cancel.dataset.focusKey = "cancel";
+        cancel.addEventListener("click", () => {
+            state.layerVerifyFocus = "run";
+            api("/api/test-run/cancel", { method: "POST", body: "{}" }).catch(showError);
+        });
+        actions.append(cancel);
+    }
+    block.append(actions);
+    const traced = plan && !["csharp", "rust", "cpp"].includes(plan.adapter_id);
+    if (traced && status.ran && !status.stale) {
+        const legend = el("p", "muted layer-verify-note trace-legend");
+        for (const [kind, text] of [["passed", "a linked test ran this changed path"], ["missed", "no linked test reached it"], ["failing", "only failing tests ran it"]]) {
+            const item = el("span", "");
+            item.append(el("span", `trace-dot trace-dot-${kind}`), text);
+            legend.append(item);
+        }
+        block.append(legend);
+    }
+    block.append(el("p", "muted layer-verify-note", running
+        ? `${run.scope?.id === layer.id ? "Running" : `Running ${run.scope ? layerLabel(state.workspaceNavigation?.layers.find((item) => item.id === run.scope.id)) || "another layer" : "all linked tests"}:`} ${
+            countLabel(run.planned || 0, "test")} in ${run.location || "the worktree"}. Usually under a minute; you can keep reading.`
+        : plan?.available ? `Runs in ${plan.location} and executes repository code.${traced ? " Changed code-path lines a linked test executed are marked in the gutter." : " Records outcomes; this language has no per-line trace."}`
+            : plan?.reason || "Checking the linked tests…"));
+    return block;
+}
+
+// Gutter marks on changed code paths that a linked test run executed (green), only failing tests executed (red), or did not reach.
+function renderTestTrace() {
+    for (const cell of elements.source.querySelectorAll(".line-number[data-trace]")) {
+        cell.removeAttribute("data-trace");
+        cell.removeAttribute("title");
+    }
+    const run = state.payload?.test_run;
+    const map = state.payload?.decision_map;
+    const source = state.source;
+    const lines = elements.source.querySelector(".code-lines");
+    // Trace dots sit left of the line number; widen the number column while any are shown so digits stay readable.
+    const widen = (marked) => { if (lines?.dataset.lineDigits) lines.style.setProperty("--source-line-digits", String(Number(lines.dataset.lineDigits) + (marked ? 1.5 : 0))); };
+    widen(false);
+    if (!source || map?.status !== "complete" || !["complete", "running"].includes(run?.status) || !run?.executed || run.stale || elements.source.getAttribute("aria-busy") === "true") return;
+    let marked = 0;
+    for (const callable of (map.callables || []).filter((item) => item.path === source.path)) {
+        if (!run.ran?.[callable.id]) continue;
+        for (const entry of callable.entries || []) {
+            if (entry.status === "removed" || entry.decision.implicit) continue;
+            const hits = run.executed[`${callable.id}:${entry.decision.line}`];
+            if (hits === undefined || hits === null) continue;
+            const row = commentRow(entry.decision.line, "RIGHT");
+            const cell = row?.children[1]?.classList.contains("line-number") ? row.children[1] : row?.querySelector(".line-number");
+            if (!cell) continue;
+            const failing = hits.length && hits.every((hit) => hit.outcome !== "passed");
+            cell.dataset.trace = !hits.length ? "missed" : failing ? "failing" : "passed";
+            marked++;
+            const names = hits.map((hit) => hit.id.split("::").at(-1));
+            cell.title = !hits.length ? `Line ${entry.decision.line}: no linked test executed this code path`
+                : `Line ${entry.decision.line}: executed by ${names.slice(0, 3).join(", ")}${names.length > 3 ? ` and ${names.length - 3} more` : ""} (${failing ? "failing" : "passed"})`;
+        }
+    }
+    widen(marked > 0);
+}
+
+// ---- Line comments: GitHub threads (read-only) and local drafts that post with the reviewer's review ----
+
+function ensurePrReview() {
+    const payload = state.payload;
+    if (!payload?.model || payload.loading || state.reviewPickerPending) return;
+    const key = `${payload.review_generation}:${JSON.stringify(payload.review_target || {})}`;
+    if (state.prReviewKey === key) return;
+    state.prReviewKey = key;
+    state.commentEditors = new Map();
+    loadPrReview();
+}
+
+async function loadPrReview({ force = false } = {}) {
+    const key = state.prReviewKey;
+    if (!force && state.prReviewLoading === key) return state.prReviewPromise;
+    state.prReviewLoading = key;
+    state.prReviewPromise = (async () => {
+        try {
+            const data = await api("/api/pr-review");
+            if (state.prReviewKey !== key) return;
+            state.prReview = data;
+            state.prReviewError = data.github_error || null;
+        } catch (error) {
+            if (state.prReviewKey !== key) return;
+            state.prReviewError = error.message;
+        } finally {
+            if (state.prReviewLoading === key) state.prReviewLoading = null;
+        }
+        renderSourceComments();
+        renderFileReview();
+        if (state.reviewPage === "finish") renderFinishReview();
+    })();
+    return state.prReviewPromise;
+}
+
+const isChangedPath = (path) => (state.payload?.model?.changes || []).some((file) => file.path === path && file.status !== "unchanged");
+// A PR whose head moved past the reviewed snapshot cannot take comments anchored to what the reviewer is reading.
+const prHeadMoved = () => state.prReview?.available && state.prReview.head_matches === false;
+
+// Lines GitHub can anchor a review comment to (inside a diff hunk), mirrored from the server's validation.
+function commentableLines(diff) {
+    const right = new Set(), left = new Set();
+    let oldLine = 0, newLine = 0, inHunk = false;
+    for (const line of String(diff || "").split(/\r?\n/)) {
+        const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+        if (hunk) { oldLine = Number(hunk[1]); newLine = Number(hunk[2]); inHunk = true; continue; }
+        if (!inHunk || /^(diff --git |index |--- |\+\+\+ |\\ )/.test(line)) continue;
+        if (line.startsWith("+")) right.add(newLine++);
+        else if (line.startsWith("-")) left.add(oldLine++);
+        else if (line.startsWith(" ")) { left.add(oldLine++); right.add(newLine++); }
+    }
+    return { RIGHT: right, LEFT: left };
+}
+
+// On a pull request GitHub's own patch decides which lines take comments; it can have narrower context than the saved diff.
+function commentableFor(source) {
+    const lines = state.prReview?.commentable;
+    if (!lines) return commentableLines(source?.diff);
+    const file = lines[source?.path];
+    return { RIGHT: new Set(file?.RIGHT || []), LEFT: new Set(file?.LEFT || []) };
+}
+
+// The Comment button and C key comment on the line being read, or the nearest commentable line on that side.
+function commentOnCurrentLine() {
+    const source = state.source;
+    if (!source || !isChangedPath(source.path)) { showError(new Error("Open a changed file to comment on it.")); return; }
+    if (prHeadMoved()) { elements.source.querySelector(".review-comment-notice")?.scrollIntoView({ block: "nearest" }); return; }
+    const viewed = viewedSourceLocation();
+    const side = viewed?.side === "base" ? "LEFT" : "RIGHT";
+    const lines = [...commentableFor(source)[side]];
+    if (!lines.length) { showError(new Error("This file has no diff lines on that side to comment on.")); return; }
+    const wanted = viewed?.line || lines[0];
+    const line = lines.reduce((best, item) => Math.abs(item - wanted) < Math.abs(best - wanted) ? item : best, lines[0]);
+    if (!commentRow(line, side)) { showError(new Error(`Line ${line} is not shown in this tab. Open the Diff tab to comment on it.`)); return; }
+    openCommentEditor({ path: source.path, line, side });
+}
+
+function commentRow(line, side) {
+    return elements.source.querySelector(`.code-row[data-${side === "LEFT" ? "old" : "new"}-line="${line}"]`);
+}
+
+// Which side a clicked line number belongs to: the first number column is the base (old) line.
+function lineNumberAnchor(row, number) {
+    const left = number === row.children[0];
+    const line = Number(left ? row.dataset.oldLine : row.dataset.newLine);
+    return line ? { line, side: left ? "LEFT" : "RIGHT" } : null;
+}
+
+// Comment blocks follow their line (after a split pair as a whole) and after any blocks already there.
+function insertAfterLine(row, block) {
+    let anchor = row.closest(".split-pair") || row;
+    while (anchor.nextElementSibling?.matches(".review-comment, .review-comment-editor, .review-comment-inline-note")) anchor = anchor.nextElementSibling;
+    anchor.after(block);
+}
+
+function commentHeader(author, meta, kind) {
+    const header = el("div", "review-comment-header");
+    header.append(el("strong", "", author), el("span", `review-comment-kind kind-${kind}`, meta));
+    return header;
+}
+
+const sideLabel = (side, line) => `${side === "LEFT" ? "base line" : "line"} ${line}`;
+
+function commentBody(text) {
+    const body = el("div", "review-comment-body markdown");
+    renderMarkdown(body, text);
+    return body;
+}
+
+function threadBlock(thread, replies, className, meta) {
+    const block = el("div", className);
+    for (const item of [thread, ...replies]) {
+        const entry = el("div", "review-comment-entry");
+        entry.append(commentHeader(item.author, item === thread ? meta : `reply · ${new Date(item.created_at).toLocaleDateString()}`, "thread"),
+            commentBody(item.body));
+        block.append(entry);
+    }
+    if (thread.url) {
+        const link = el("a", "review-comment-link", "Reply on GitHub");
+        link.href = thread.url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        block.append(link);
+    }
+    return block;
+}
+
+const editorKey = (editor) => editor.id ? `draft:${editor.id}` : `new:${editor.path}:${editor.side}:${editor.line}`;
+const editorDirty = (editor) => editor.body.trim() !== (editor.original || "").trim();
+
+function renderSourceComments() {
+    // Keep the caret in whichever editor is being typed in across re-renders.
+    const active = document.activeElement?.closest?.(".review-comment-editor");
+    const focusKey = active?.dataset.editorKey || state.commentFocusKey;
+    const selection = active ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null;
+    state.commentFocusKey = null;
+    elements.source.querySelectorAll(".review-comment, .review-comment-editor, .review-comment-outdated, .review-comment-notice, .review-comment-inline-note")
+        .forEach((node) => node.remove());
+    const source = state.source;
+    const data = state.prReview;
+    const moved = prHeadMoved();
+    elements.workspace_comment.disabled = !source || !isChangedPath(source.path) || moved;
+    elements.workspace_comment.title = !source || !isChangedPath(source.path) ? "Open a changed file to comment on it"
+        : moved ? "The pull request has newer commits than this review; re-open it to comment"
+        : `${data?.available ? "Draft a pull request comment" : "Comment"} on the line you are reading (C), or click a line number`;
+    if (!source || elements.source.getAttribute("aria-busy") === "true") return;
+    const path = source.path;
+    const lines = elements.source.querySelector(".code-lines");
+    const commentable = isChangedPath(path) && !moved ? commentableFor(source) : { RIGHT: new Set(), LEFT: new Set() };
+    for (const row of elements.source.querySelectorAll(".code-row")) {
+        for (const number of row.querySelectorAll(":scope > .line-number")) {
+            const anchor = lineNumberAnchor(row, number);
+            number.classList.toggle("commentable", Boolean(anchor && commentable[anchor.side].has(anchor.line)));
+        }
+    }
+    if (!data) return;
+    if (moved && lines) {
+        const notice = el("div", "review-comment-notice");
+        notice.setAttribute("role", "status");
+        notice.append(el("strong", "", "This pull request has newer commits. "), `GitHub's head is ${String(data.head || "").slice(0, 7)}; this review shows ${
+            String(data.reviewed_head || "").slice(0, 7)}. Commenting and Viewed sync are paused so nothing is posted against code you did not read. Re-open the pull request in Agent Review to review the new commits.`);
+        lines.prepend(notice);
+    }
+    const threads = (data.threads || []).filter((thread) => thread.path === path);
+    const repliesTo = (thread) => threads.filter((reply) => reply.reply_to === thread.id);
+    for (const thread of threads.filter((item) => !item.reply_to && !item.outdated)) {
+        const row = commentRow(thread.line, thread.side);
+        if (!row) continue;
+        insertAfterLine(row, threadBlock(thread, repliesTo(thread), "review-comment review-comment-thread",
+            `on GitHub · ${thread.side === "LEFT" ? "base · " : ""}${new Date(thread.created_at).toLocaleDateString()}`));
+    }
+    const outdated = threads.filter((item) => !item.reply_to && item.outdated);
+    if (outdated.length && lines) {
+        const details = el("details", "review-comment-outdated");
+        details.append(el("summary", "", `${countLabel(outdated.length, "comment")} on other commits of this file`));
+        for (const thread of outdated) {
+            details.append(threadBlock(thread, repliesTo(thread), "review-comment-entry",
+                `${sideLabel(thread.side, thread.original_line ?? "?")} on commit ${String(thread.original_commit || "").slice(0, 7) || "unknown"}`));
+        }
+        lines.prepend(details);
+    }
+    const editors = state.commentEditors || new Map();
+    for (const draft of (data.drafts?.comments || []).filter((item) => item.path === path)) {
+        const row = commentRow(draft.line, draft.side);
+        if (!row || editors.has(`draft:${draft.id}`)) continue;
+        const block = el("div", "review-comment review-comment-draft");
+        block.dataset.draftId = draft.id;
+        block.append(commentHeader("Your draft", `${sideLabel(draft.side, draft.line)} · ${data.available ? "pending · posts with your review" : "local · included in the handoff"}`, "draft"),
+            commentBody(draft.body));
+        const actions = el("div", "review-comment-actions");
+        const edit = el("button", "link-button", "Edit");
+        edit.type = "button";
+        edit.setAttribute("aria-label", `Edit draft on ${sideLabel(draft.side, draft.line)}`);
+        edit.addEventListener("click", () => openCommentEditor({ path, line: draft.line, side: draft.side, id: draft.id, body: draft.body }));
+        const remove = el("button", "link-button", "Delete");
+        remove.type = "button";
+        remove.setAttribute("aria-label", `Delete draft on ${sideLabel(draft.side, draft.line)}`);
+        remove.addEventListener("click", async () => {
+            try { await saveDraftChange({ action: "delete", id: draft.id }); }
+            catch (error) { showError(error); }
+            elements.source.focus({ preventScroll: true });
+        });
+        actions.append(edit, remove);
+        block.append(actions);
+        insertAfterLine(row, block);
+    }
+    for (const [key, editor] of editors) {
+        if (editor.path !== path) continue;
+        const row = commentRow(editor.line, editor.side);
+        if (!row) continue;
+        const block = commentEditorBlock(key, editor);
+        insertAfterLine(row, block);
+        if (key === focusKey) {
+            const textarea = block.querySelector("textarea");
+            requestAnimationFrame(() => {
+                textarea.focus({ preventScroll: !!selection });
+                if (selection) textarea.setSelectionRange(...selection);
+            });
+        }
+    }
+    const note = state.commentNote;
+    if (note?.path === path) {
+        const row = commentRow(note.line, note.side);
+        if (row) {
+            const node = el("p", "review-comment-inline-note", note.message);
+            node.setAttribute("role", "status");
+            insertAfterLine(row, node);
+        }
+    }
+}
+
+function commentEditorBlock(key, editor) {
+    const block = el("div", "review-comment-editor");
+    block.dataset.editorKey = key;
+    const label = `${editor.path.split("/").at(-1)}:${editor.line}${editor.side === "LEFT" ? " (base)" : ""}`;
+    const textarea = el("textarea", "");
+    textarea.rows = 3;
+    textarea.maxLength = 4000;
+    textarea.value = editor.body;
+    textarea.setAttribute("aria-label", `Comment on ${label}`);
+    textarea.placeholder = state.prReview?.available ? "Leave a comment. It posts when you submit your review." : "Leave a comment. It is saved locally and included in the handoff.";
+    textarea.addEventListener("input", () => { editor.body = textarea.value; });
+    const error = el("p", "error", editor.error || "");
+    error.setAttribute("role", "alert");
+    error.classList.toggle("hidden", !editor.error);
+    const actions = el("div", "review-comment-actions");
+    const cancel = el("button", "", "Cancel");
+    cancel.type = "button";
+    const save = el("button", "review-comment-save", editor.id ? "Save comment" : "Add comment");
+    save.type = "button";
+    save.disabled = Boolean(editor.saving);
+    const submit = async () => {
+        if (editor.saving) return;
+        editor.saving = true;
+        editor.error = null;
+        save.disabled = true;
+        error.classList.add("hidden");
+        try {
+            await saveDraftChange(editor.id ? { action: "edit", id: editor.id, body: editor.body }
+                : { action: "add", comment: { path: editor.path, line: editor.line, side: editor.side, body: editor.body } });
+            state.commentEditors.delete(key);
+            renderSourceComments();
+            elements.source.focus({ preventScroll: true });
+        } catch (failure) {
+            editor.saving = false;
+            editor.error = failure.message;
+            // A draft deleted elsewhere cannot be edited; keep the text as a new comment on the same line instead.
+            if (failure.code === "draft_missing") {
+                state.commentEditors.delete(key);
+                delete editor.id;
+                editor.original = "";
+                editor.error = "This draft was deleted in another tab. Your text is kept here; select Add comment to save it as a new comment.";
+                state.commentEditors.set(editorKey(editor), editor);
+                state.commentFocusKey = editorKey(editor);
+            } else state.commentFocusKey = key;
+            renderSourceComments();
+        }
+    };
+    cancel.addEventListener("click", () => { state.commentEditors.delete(key); renderSourceComments(); elements.source.focus({ preventScroll: true }); });
+    save.addEventListener("click", submit);
+    textarea.addEventListener("keydown", (event) => {
+        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); submit(); }
+        if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); cancel.click(); }
+    });
+    actions.append(cancel, save);
+    block.append(el("p", "review-comment-target muted", `${editor.id ? "Edit comment" : "Comment"} on ${label}`), textarea, error, actions);
+    return block;
+}
+
+// Several editors can be open at once, like on GitHub; opening one never discards text typed in another.
+async function openCommentEditor(editor) {
+    if (!isChangedPath(editor.path)) { showError(new Error("Comments can only be added to changed files.")); return; }
+    // Comments may still be loading from GitHub; open the editor as soon as they arrive rather than refusing.
+    if (!state.prReview) {
+        ensurePrReview();
+        await state.prReviewPromise;
+        if (!state.prReview) { showError(new Error(state.prReviewError || "Review comments could not be loaded.")); return; }
+        if (state.source?.path !== editor.path) return;
+    }
+    if (prHeadMoved()) { renderSourceComments(); return; }
+    state.commentEditors ||= new Map();
+    const key = editorKey(editor);
+    if (!state.commentEditors.has(key)) state.commentEditors.set(key, { ...editor, body: editor.body || "", original: editor.body || "" });
+    state.commentNote = null;
+    state.commentFocusKey = key;
+    renderSourceComments();
+}
+
+window.addEventListener("beforeunload", (event) => {
+    if ([...(state.commentEditors?.values() || [])].some(editorDirty)) event.preventDefault();
+});
+
+async function saveDraftChange(change) {
+    const drafts = state.prReview?.drafts;
+    if (!drafts) throw new Error("Review comments are still loading.");
+    const send = (revision) => api("/api/pr-review/drafts", { method: "POST", body: JSON.stringify({ revision, ...change }) });
+    const missing = (list) => change.id && !list.comments.some((comment) => comment.id === change.id);
+    if (missing(drafts)) {
+        if (change.action === "delete") return;
+        throw Object.assign(new Error("This draft was deleted in another tab."), { code: "draft_missing" });
+    }
+    let result;
+    try { result = await send(drafts.revision); }
+    catch (error) {
+        if (error.status !== 409) throw error;
+        // Another tab changed the drafts: reload them and apply this one change on top.
+        await loadPrReview({ force: true });
+        const current = state.prReview?.drafts;
+        if (!current) throw new Error("Review comments could not be reloaded; your text is kept. Try again.");
+        if (missing(current)) {
+            if (change.action === "delete") return;
+            throw Object.assign(new Error("This draft was deleted in another tab."), { code: "draft_missing" });
+        }
+        result = await send(current.revision);
+    }
+    state.prReview = { ...state.prReview, drafts: result };
+    renderSourceComments();
+    renderFileReview();
+}
+
+// Clicking a line number starts a comment on that side of that line.
+elements.source.addEventListener("click", (event) => {
+    const number = event.target.closest?.(".line-number");
+    const row = number?.closest(".code-row");
+    if (!number || !row || !state.source || !isChangedPath(state.source.path)) return;
+    const anchor = lineNumberAnchor(row, number);
+    if (!anchor) return;
+    if (prHeadMoved()) return;
+    if (!commentableFor(state.source)[anchor.side].has(anchor.line)) {
+        // Explain beside the line rather than with the page-wide error banner.
+        state.commentNote = { path: state.source.path, ...anchor,
+            message: state.prReview?.commentable
+                ? `${sideLabel(anchor.side, anchor.line)} is outside the pull request's diff on GitHub, so GitHub cannot anchor a comment there. Comment on a changed or nearby line.`
+                : `${sideLabel(anchor.side, anchor.line)} is outside the diff. Comment on a changed or nearby line.` };
+        renderSourceComments();
+        return;
+    }
+    openCommentEditor({ path: state.source.path, ...anchor });
+});
+
+function applySourceFocus(rows, focusStart, focusEnd, focusSide) {
+    const focused = [];
     if (Number.isFinite(focusStart) && focusStart > 0) {
-        const focused = [];
         for (const row of rows) {
             const oldLine = Number(row.dataset?.oldLine);
             const newLine = Number(row.dataset?.newLine);
@@ -1741,27 +5739,8 @@ function renderSource({ preserveScroll = false, focusGap = null } = {}) {
             if (index === 0) row.classList.add("focus-start");
             if (index === focused.length - 1) row.classList.add("focus-end");
         });
-        if (state.sourceTab !== "diff" && !preserveScroll) focused[0]?.scrollIntoView({ block: "center" });
     }
-    const cited = applyCitedHighlights(rows);
-    if (preserveScroll) {
-        elements.source.scrollTop = previousScroll.top;
-        elements.source.scrollLeft = previousScroll.left;
-        if (focusGap) rows.find((row) => row.dataset?.gap === focusGap)?.focus({ preventScroll: true });
-    } else if (cited[0] && !(Number.isFinite(focusStart) && focusStart > 0)) {
-        cited[0].scrollIntoView({ block: "center" });
-    }
-    renderChangeRuler(rows);
-    const annotation = state.payload?.annotations?.[state.selected?.id];
-    const selectedPath = state.selected?.path || state.payload?.model?.nodes?.find((node) =>
-        node.id === (state.selected?.node_id || state.selected?.id))?.path;
-    if (annotation && selectedPath === state.source.path) renderAnnotation(state.selected, annotation);
-    else elements.source_annotation.classList.add("hidden");
-    renderSourceRisk();
-    renderSourceDecisions();
-    renderProvenance();
-    document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === state.sourceTab));
-    renderSourceNavigation();
+    return focused;
 }
 
 // Lines cited by a check (for example, repository rules) stay marked in whichever tab shows them.
@@ -1820,7 +5799,8 @@ function renderChangeRuler(rows) {
 function collectionTitle(mode) {
     if (mode === "areas") return state.areaGroup?.title || "Large change areas";
     return {
-        walkthrough: "Risk-first walkthrough",
+        impact: "Change impact", sections: "Review sections",
+        walkthrough: "Attention",
         files: "Changed files", lines: "Lines changed by file", symbols: "Changed symbols",
         edges: "New relationships", packages: "Package changes", findings: "Ranked findings",
         decisions: "Code path changes",
@@ -1829,11 +5809,23 @@ function collectionTitle(mode) {
 
 function openReviewPlanItem(item) {
     if (item.kind === "package") {
-        openPackage(item.package);
+        const declaration = (item.package.declared_current?.length ? item.package.declared_current : item.package.declared_base || [])[0];
+        if (!declaration?.source) {
+            showError(new Error("This priority has no saved package declaration to review. Browse all changed files instead."));
+            return;
+        }
+        rememberSourceReturnFocus();
+        state.selected = { ...item.package, kind: "package" };
+        setDiscussionMode(false);
+        renderDetail(state.selected);
+        openSourceReference({ path: declaration.source, lines: declaration.line ? [declaration.line] : [],
+            side: item.package.change === "removed" ? "base" : "current", packageName: item.package.name },
+        { focus: true, tab: "diff", nav: "reset" }).catch(showError);
         return;
     }
     if (item.kind === "callable" && item.preferred) {
-        openDecision(item.callable, item.preferred.entry);
+        rememberSourceReturnFocus();
+        openDecision(item.callable, item.preferred.entry, { focus: true });
         return;
     }
     selectItem(item.finding || item.node, false);
@@ -1845,63 +5837,78 @@ function renderReviewPlan(model, findings) {
     const plan = allPlan
         .filter((item) => !query || `${item.title} ${item.path || ""} ${item.reasons.join(" ")}`.toLowerCase().includes(query));
     const progress = reviewProgress(allPlan, state.reviewLedger);
-    const next = nextReviewItem(allPlan, state.reviewLedger);
     const view = el("div", "collection-list review-plan");
     const intro = el("section", "review-plan-intro");
     const introCopy = el("div", "");
     introCopy.append(
-        el("strong", "", "Review highest-risk unverified changes first"),
-        el("p", "muted", "Priority combines rule-based impact, changed lines, caller reach, and the strongest available test evidence. It updates after linked tests run."),
-        el("p", "review-progress", `${progress.completed} of ${progress.total} reviewed${progress.followUp ? ` · ${progress.followUp} needs follow-up` : ""}`),
+        el("strong", "", "Attention"),
+        el("p", "muted", "Changes that cross impact, churn, caller-reach, dependency or untested-behavior thresholds, shown in reading-path layer order and by priority within each layer. Review follows the layers; this is a lens, not a second order."),
     );
-    intro.append(introCopy);
-    if (allPlan.length) {
-        const start = el("button", "review-next", next ? "Review next" : "Review complete");
-        start.type = "button";
-        start.disabled = !next;
-        if (next) start.addEventListener("click", () => openReviewPlanItem(next));
-        intro.append(start);
+    if (progress.total) {
+        introCopy.append(el("p", "review-progress",
+            `${progress.completed.toLocaleString()} of ${countLabel(progress.total, "attention item")} covered by reviewed files or concern triage${
+                progress.followUp ? ` · ${countLabel(progress.followUp, "item")} ${plural(progress.followUp, "needs", "need")} follow-up` : ""}${
+                allPlan.omitted ? ` · ${countLabel(allPlan.omitted, "additional qualifying change")} omitted` : ""}`));
     }
+    intro.append(introCopy);
     view.append(intro);
     if (!plan.length) {
-        view.append(el("p", "collection-empty", "No risk-ranked changes match this filter."));
+        view.append(el("p", "collection-empty", query
+            ? "No attention items match this filter."
+            : "No changes crossed the attention thresholds. Use the reading path, Architecture, Files, or Code paths for exhaustive inspection."));
         elements.graph.replaceChildren(view);
         return;
     }
+    const navigation = layeredNavigation();
+    const buckets = new Map((navigation?.layers || []).map((layer) => [layer.id, []]));
+    const unplaced = [];
+    for (const item of plan) {
+        const layer = item.path && layerOf(navigation, { path: item.path });
+        (layer ? buckets.get(layer.id) : unplaced).push(item);
+    }
+    const sections = [...(navigation?.layers || []).map((layer) => [layer, buckets.get(layer.id)]), [null, unplaced]]
+        .filter(([, items]) => items.length);
     const dispositionLabels = Object.fromEntries(REVIEW_DISPOSITIONS);
-    for (const [index, item] of plan.entries()) {
-        const record = state.reviewLedger.get(item.id);
-        const disposition = record?.disposition || "pending";
-        const row = el("button", "review-plan-row");
-        row.type = "button";
-        row.dataset.reviewId = item.id;
-        row.dataset.disposition = disposition;
-        row.classList.toggle("is-reviewed", isReviewComplete(disposition));
-        row.classList.toggle("needs-follow-up", disposition === "follow-up");
-        const copy = el("span", "review-plan-copy");
-        const heading = el("span", "review-plan-heading");
-        heading.append(el("strong", "", item.title));
-        const badges = el("span", "review-plan-badges");
-        if (disposition !== "pending") badges.append(el("span", `review-disposition disposition-${disposition}`, dispositionLabels[disposition]));
-        badges.append(el("b", "impact-score", `Priority ${item.score}/100`));
-        heading.append(badges);
-        copy.append(heading);
-        if (item.path) copy.append(el("span", "review-plan-path", `${item.path}${item.line ? `:${item.line}` : ""}`));
-        if (record?.note) {
-            const note = el("span", "review-plan-note", `${record.path}${record.line ? `:${record.line}` : ""} · ${record.note}`);
-            copy.append(note);
+    for (const [layer, items] of sections) {
+        if (sections.length > 1 || layer) {
+            view.append(el("h3", "review-plan-layer", layer ? layerLabel(layer) : "Outside the reading path"));
         }
-        const reasons = el("span", "review-plan-reasons");
-        for (const reason of item.reasons) reasons.append(el("span", "", reason));
-        copy.append(reasons);
-        const proof = el("span", "review-plan-proof");
-        if (item.evidence.untested) proof.append(el("span", "proof-untested", `${item.evidence.untested} untested`));
-        if (item.evidence.inferred) proof.append(el("span", "proof-inferred", `${item.evidence.inferred} inferred`));
-        if (item.evidence.confirmed) proof.append(el("span", "proof-confirmed", `${item.evidence.confirmed} confirmed`));
-        if (proof.childElementCount) copy.append(proof);
-        row.append(el("span", "review-rank", String(index + 1)), copy, el("span", "review-plan-open", "Review →"));
-        row.addEventListener("click", () => openReviewPlanItem(item));
-        view.append(row);
+        for (const item of items.sort((a, b) => b.score - a.score)) {
+            const record = state.reviewLedger.get(item.id);
+            const disposition = effectiveDisposition(item, state.reviewLedger);
+            const row = el("button", "review-plan-row");
+            row.type = "button";
+            row.dataset.reviewId = item.id;
+            row.dataset.disposition = disposition;
+            row.classList.toggle("is-reviewed", isReviewComplete(disposition));
+            row.classList.toggle("needs-follow-up", disposition === "follow-up");
+            const copy = el("span", "review-plan-copy");
+            const heading = el("span", "review-plan-heading");
+            heading.append(el("strong", "", item.title));
+            const badges = el("span", "review-plan-badges");
+            if (disposition !== "pending") badges.append(el("span", `review-disposition disposition-${disposition}`, dispositionLabels[disposition]));
+            badges.append(el("b", "impact-score", `Static priority ${item.score}/100`));
+            heading.append(badges);
+            copy.append(heading);
+            if (item.path) copy.append(el("span", "review-plan-path", `${item.path}${item.line ? `:${item.line}` : ""}`));
+            if (record?.note) {
+                const note = el("span", "review-plan-note", `${record.path}${record.line ? `:${record.line}` : ""} · ${record.note}`);
+                copy.append(note);
+            }
+            const reasons = el("span", "review-plan-reasons");
+            for (const reason of item.reasons) reasons.append(el("span", "", reason));
+            copy.append(reasons);
+            const proof = el("span", "review-plan-proof");
+            if (item.evidence.untested) proof.append(el("span", "proof-untested", `${item.evidence.untested} untested`));
+            if (item.evidence.inferred) proof.append(el("span", "proof-inferred", `${item.evidence.inferred} inferred`));
+            if (item.evidence.confirmed) proof.append(el("span", "proof-confirmed", `${item.evidence.confirmed} confirmed`));
+            if (proof.childElementCount) copy.append(proof);
+            const chip = layer ? layerMarker(layer, "layer-chip") : el("span", "layer-chip", "–");
+            chip.title = layer ? layerLabel(layer) : "Outside the reading path";
+            row.append(chip, copy, el("span", "review-plan-open", "Open →"));
+            row.addEventListener("click", () => openReviewPlanItem(item));
+            view.append(row);
+        }
     }
     elements.graph.replaceChildren(view);
 }
@@ -1986,7 +5993,7 @@ function renderCollection(model) {
             row.addEventListener("click", () => selectFile(item));
         } else if (item.source && item.target) {
             title = `${nodeById.get(item.source)?.name || item.source} → ${nodeById.get(item.target)?.name || item.target}`;
-            subtitle = `${item.type} · ${item.count || 1} relationship${item.count === 1 ? "" : "s"} · ${item.confidence}`;
+            subtitle = `${item.type} · ${countLabel(item.count || 1, "relationship")} · ${item.confidence}`;
             row.addEventListener("click", () => selectItem(item));
         } else if (item.id?.startsWith("package:")) {
             title = item.name;
@@ -2030,22 +6037,27 @@ function renderCollection(model) {
 
 function decisionMetric(map) {
     const totals = decisionTotals(map);
+    const partial = map && (map.limited || map.incomplete || map.callables?.some((item) => item.incomplete || item.truncated));
     let detail;
     if (!map) detail = "Unavailable for this review";
     else if (map.status === "loading") detail = "Extracting code paths…";
     else if (map.status === "error") detail = "Extraction failed";
+    else if (partial) detail = "Partial path model · see analysis notes";
     else if (!map.callables?.length) detail = "No changed production callables";
     else if (!totals.callables) detail = "No code path changes";
     else {
         const untested = map.verification ? evidenceCounts(map, state.payload?.test_run).untested : null;
-        detail = [`${totals.callables} callable${totals.callables === 1 ? "" : "s"}`,
+        detail = [countLabel(totals.callables, "callable"),
             untested !== null ? `${untested} without test evidence`
-                : totals.gates ? `${totals.gates} conditional gate${totals.gates === 1 ? "" : "s"}` : null].filter(Boolean).join(" · ");
+                : totals.gates ? countLabel(totals.gates, "conditional gate") : null].filter(Boolean).join(" · ");
     }
     if (map?.status !== "complete") {
         const card = metric("Code paths", map?.status === "loading" ? "…" : "–", detail, "decisions");
         if (map?.status === "loading") card.classList.add("metric-pending");
         return card;
+    }
+    if (partial && !(totals.added + totals.removed + totals.changed + totals.moved)) {
+        return metric("Code paths", "Unknown", detail, "decisions");
     }
     return deltaMetric("Code paths", totals.added, totals.removed, detail, "decisions", totals.changed + totals.moved);
 }
@@ -2127,7 +6139,9 @@ function decisionCounts(item) {
     return counts;
 }
 
-async function openDecision(callable, entry, { select = true } = {}) {
+async function openDecision(callable, entry, { select = true, focus = false } = {}) {
+    rememberSourceOrigin();
+    rememberCurrentSource();
     const node = state.payload?.model?.nodes.find((candidate) => candidate.id === callable.id);
     if (select && node) {
         state.selected = node;
@@ -2139,7 +6153,9 @@ async function openDecision(callable, entry, { select = true } = {}) {
     const side = entry.status === "removed" ? "base" : "current";
     const query = `path=${encodeURIComponent(callable.path)}&line=${decision.line}&end=${decision.end_line || decision.line}&side=${side}`;
     try {
-        if (await loadSource(query, epoch, side, select ? "reset" : "push") && state.selected) ensureAnnotation(state.selected, epoch);
+        const loaded = await loadSource(query, epoch, side, "push", {}, { preserveContext: !select });
+        if (loaded && select && state.selected) ensureAnnotation(state.selected, epoch);
+        if (loaded && focus && epoch === state.selectionEpoch) elements.source.focus({ preventScroll: true });
     } catch (error) {
         if (epoch === state.selectionEpoch) showError(error);
     }
@@ -2171,7 +6187,8 @@ function renderDecisionView(model) {
         }
         return;
     }
-    if (map.limited) view.append(el("p", "flash", "Large review: code path extraction covered a bounded set of files and callables."));
+    const incomplete = map.limited || map.incomplete || map.callables?.some((item) => item.incomplete || item.truncated);
+    if (incomplete) view.append(el("p", "flash", "Partial path model: omitted or unmodelled code remains unknown. See analysis notes."));
     if (map.warnings?.length) {
         const notes = el("details", "code-path-notes");
         const key = `${state.payload?.review_generation}:${map.total_ms}`;
@@ -2179,7 +6196,7 @@ function renderDecisionView(model) {
         notes.addEventListener("toggle", () => {
             if (notes.isConnected) state.codePathNotesOpenKey = notes.open ? key : null;
         });
-        notes.append(el("summary", "", `${map.warnings.length} analysis notes about these code paths`),
+        notes.append(el("summary", "", `${countLabel(map.warnings.length, "analysis note")} about these code paths`),
             el("p", "analysis-warning-intro", "These explain incomplete static analysis. They are not confirmed runtime failures."),
             analysisWarningList(map.warnings));
         view.append(notes);
@@ -2194,8 +6211,10 @@ function renderDecisionView(model) {
     const changed = changedCallables(map).filter(matches).filter((item) => visibleEntries(item).length).sort((a, b) =>
         (b.entries?.length || 0) - (a.entries?.length || 0) || a.path.localeCompare(b.path) || (a.line || 0) - (b.line || 0));
     const quiet = filter !== "all" ? [] : (map.callables || []).filter((item) => !changed.includes(item) && !(item.entries?.length) && matches(item));
+    const partial = map.limited || map.incomplete || map.callables?.some((item) => item.incomplete || item.truncated);
     if (!changed.length) {
         view.append(el("p", "collection-empty", filter !== "all" ? "No code paths match this evidence filter."
+            : partial ? "No code path changes were found in the analyzed subset; omitted or unmodelled code remains unknown."
             : map.callables?.length
                 ? "No code path changes: changed callables keep the same exits, error handling, and wiring."
                 : "No changed production callables in supported languages in this review."));
@@ -2215,7 +6234,8 @@ function renderDecisionView(model) {
         group.append(header);
         const rows = el("div", "decision-rows");
         rows.append(...visibleEntries(item).map((entry) => decisionRow(item, entry, openDecision)));
-        if (item.omitted_entries) rows.append(el("p", "muted decision-omitted", `${item.omitted_entries} more code path changes not shown.`));
+        if (item.omitted_entries) rows.append(el("p", "muted decision-omitted",
+            `${countLabel(item.omitted_entries, "more code path change")} not shown.`));
         if (item.truncated) rows.append(el("p", "muted decision-omitted", "Very large callable: only the first code paths were extracted."));
         group.append(rows);
         view.append(group);
@@ -2224,9 +6244,9 @@ function renderDecisionView(model) {
         const same = quiet.filter((item) => item.change === "modified").length;
         const none = quiet.length - same;
         const details = el("details", "decision-unchanged");
-        details.append(el("summary", "", [
-            same ? `${same} modified callable${same === 1 ? " keeps" : "s keep"} the same code paths` : null,
-            none ? `${none} added or removed callable${none === 1 ? " has" : "s have"} no exits, handlers, or wiring` : null,
+        details.append(el("summary", "", partial ? `${countLabel(quiet.length, "callable")} with no modelled code path changes (partial analysis)` : [
+            same ? `${countLabel(same, "modified callable")} ${plural(same, "keeps", "keep")} the same code paths` : null,
+            none ? `${countLabel(none, "added or removed callable")} ${plural(none, "has", "have")} no exits, handlers, or wiring` : null,
         ].filter(Boolean).join(" · ")));
         const list = el("div", "decision-unchanged-list");
         for (const item of quiet) {
@@ -2257,7 +6277,15 @@ function testPlanFor(generation) {
                 state.sourceDecisionsKey = null;
                 renderSourceDecisions();
             }
-        }).catch((error) => { state.testPlan = { generation, plan: { available: false, reason: error.message } }; });
+        }).catch((error) => {
+            if (state.testPlan?.generation !== generation) return;
+            state.testPlan = { generation, plan: { available: false, reason: error.message } };
+            if (state.mode === "decisions") render();
+            if (!elements.source_panel.classList.contains("hidden")) {
+                state.sourceDecisionsKey = null;
+                renderSourceDecisions();
+            }
+        });
     }
     return null;
 }
@@ -2272,7 +6300,7 @@ function renderVerificationBar(map, { compact = false, callables = null } = {}) 
             counts.untested ? `${counts.untested} untested` : null,
             counts.inferred ? `${counts.inferred} inferred` : null,
             counts.confirmed ? `${counts.confirmed} confirmed` : null,
-        ].filter(Boolean).join(" · ") || `${total} paths`));
+        ].filter(Boolean).join(" · ") || countLabel(total, "path")));
     } else {
         const filters = el("div", "verification-filters");
         filters.setAttribute("role", "group");
@@ -2299,7 +6327,7 @@ function renderVerificationBar(map, { compact = false, callables = null } = {}) 
     const button = el("button", "verification-run-button", run?.status === "running" ? "Running…" : "Run linked tests");
     button.type = "button";
     button.disabled = run?.status === "running" || !plan?.available;
-    button.title = plan?.available ? `Runs ${plan.tests.length} linked tests${["csharp", "rust"].includes(plan.adapter_id) ? " with test outcomes (no per-test path tracing)" : " with line tracing"}: ${plan.command}` : plan?.reason || "Checking linked tests…";
+    button.title = plan?.available ? `Runs ${countLabel(plan.tests.length, "linked test")}${["csharp", "rust", "cpp"].includes(plan.adapter_id) ? " with test outcomes (no per-test path tracing)" : " with line tracing"}: ${plan.command}` : plan?.reason || "Checking linked tests…";
     button.addEventListener("click", async () => {
         button.disabled = true;
         try {
@@ -2315,10 +6343,11 @@ function renderVerificationBar(map, { compact = false, callables = null } = {}) 
         cancel.type = "button";
         cancel.addEventListener("click", () => api("/api/test-run/cancel", { method: "POST", body: "{}" }).catch(showError));
         runner.append(cancel);
-        status.textContent = `Running ${run.planned} linked tests in ${run.location || "the worktree"} with ${run.python}…`;
+        status.textContent = `Running ${countLabel(run.planned, "linked test")} in ${run.location || "the worktree"} with ${run.python}…`;
         status.classList.add("is-running");
     } else if (run?.status === "complete") {
-        const parts = ["passed", "failed", "error", "skipped"].filter((key) => run.counts?.[key]).map((key) => `${run.counts[key]} ${key}`);
+        const parts = ["passed", "failed", "error", "skipped"].filter((key) => run.counts?.[key])
+            .map((key) => key === "error" ? countLabel(run.counts[key], "error") : `${run.counts[key]} ${key}`);
         status.textContent = `${parts.join(" · ") || "No tests ran"} · ${run.path_evidence_limitation || "Confirmed paths use per-test line traces."}${run.stale ? " Stale: the worktree changed after this run." : ""}`;
         status.classList.toggle("is-stale", Boolean(run.stale));
         status.classList.toggle("has-failures", Boolean(run.counts?.failed || run.counts?.error));
@@ -2329,7 +6358,7 @@ function renderVerificationBar(map, { compact = false, callables = null } = {}) 
         status.textContent = "Test run cancelled.";
     } else {
         status.textContent = plan?.available
-            ? `Runs ${plan.tests.length} linked test${plan.tests.length === 1 ? "" : "s"} in ${plan.location} with ${plan.python} (${plan.python_source}). ${plan.prerequisites || "Executes repository code."}`
+            ? `Runs ${countLabel(plan.tests.length, "linked test")} in ${plan.location} with ${plan.python} (${plan.python_source}). ${plan.prerequisites || "Executes repository code."}`
             : plan?.reason || "Checking linked tests…";
     }
     runner.append(status);
@@ -2354,7 +6383,9 @@ function renderLinkedTests(map) {
     section.open = state.linkedTestsOpen !== false;
     section.addEventListener("toggle", () => { if (section.isConnected) state.linkedTestsOpen = section.open; });
     const tests = map.verification.tests;
-    section.append(el("summary", "", `Linked tests · ${tests.length}${map.verification.omitted_tests ? ` of ${tests.length + map.verification.omitted_tests}` : ""}`));
+    section.append(el("summary", "", `${countLabel(tests.length, "Linked test")}${
+        map.verification.omitted_tests ? ` shown of ${(tests.length + map.verification.omitted_tests).toLocaleString()}` : ""}${
+        map.verification.omitted_test_candidates ? ` · ${countLabel(map.verification.omitted_test_candidates, "test candidate")} not examined` : ""}`));
     const list = el("div", "linked-test-list");
     for (const test of tests) {
         const row = el("button", "linked-test");
@@ -2367,8 +6398,10 @@ function renderLinkedTests(map) {
         const outcome = outcomeFor(test.id);
         if (outcome) row.append(el("span", `label test-outcome outcome-${outcome}`, outcome));
         row.addEventListener("click", async () => {
+            rememberSourceOrigin();
+            rememberCurrentSource();
             const epoch = ++state.selectionEpoch;
-            try { await loadSource(`path=${encodeURIComponent(test.path)}&line=${test.line}&side=current`, epoch, "current", "reset"); }
+            try { await loadSource(`path=${encodeURIComponent(test.path)}&line=${test.line}&side=current`, epoch, "current", "push"); }
             catch (error) { if (epoch === state.selectionEpoch) showError(error); }
         });
         list.append(row);
@@ -2383,6 +6416,8 @@ function renderSourceRisk() {
     const selected = state.selected;
     if (!model || !selected || !state.source) {
         panel.classList.add("hidden");
+        state.sourceStripRisk = null;
+        renderSourceStrip();
         return;
     }
     const findings = [
@@ -2398,15 +6433,19 @@ function renderSourceRisk() {
         || candidate.finding?.id === selectedId);
     if (!item || (item.path && item.path !== state.source.path && item.kind !== "package")) {
         panel.classList.add("hidden");
+        state.sourceStripRisk = null;
+        renderSourceStrip();
         return;
     }
     panel.replaceChildren();
     panel.classList.remove("hidden");
     const heading = el("div", "source-risk-heading");
-    heading.append(
-        el("strong", "", item.finding?.title || item.title),
-        el("b", "impact-score", `Priority ${item.score}/100`),
-    );
+    const score = el("b", "impact-score", `Static priority ${item.score}/100`);
+    score.title = "Deterministic priority from impact, churn, caller reach and test evidence. It is separate from any AI risk assessment.";
+    heading.append(el("strong", "", item.finding?.title || item.title), score);
+    const explanation = item.finding?.reason || item.finding?.body;
+    if (explanation) panel.append(heading, el("p", "source-risk-copy", explanation));
+    else panel.append(heading);
     const reasons = el("div", "source-risk-reasons");
     for (const reason of item.reasons.filter((reason) => reason !== item.finding?.title)) {
         reasons.append(el("span", "", reason));
@@ -2414,12 +6453,15 @@ function renderSourceRisk() {
     const record = state.reviewLedger.get(item.id);
     const controls = el("div", "source-review-controls");
     const dispositionLabel = el("label", "");
-    dispositionLabel.append(document.createTextNode("Disposition"));
+    dispositionLabel.append(document.createTextNode("Triage"));
     const disposition = el("select", "source-review-disposition");
-    for (const [value, label] of REVIEW_DISPOSITIONS) {
+    // Triage explains a concern; review progress itself is the whole-file decision.
+    const current = record?.disposition || "pending";
+    for (const [value, label] of [["pending", "Not triaged"], ["follow-up", "Needs follow-up"], ["accepted", "Accepted risk"],
+        ["false-positive", "False positive"], ...(current === "reviewed" ? [["reviewed", "Reviewed (earlier record)"]] : [])]) {
         const option = el("option", "", label);
         option.value = value;
-        option.selected = (record?.disposition || "pending") === value;
+        option.selected = current === value;
         disposition.append(option);
     }
     dispositionLabel.append(disposition);
@@ -2429,7 +6471,7 @@ function renderSourceRisk() {
     note.value = record?.note || "";
     note.placeholder = `Review note for ${state.source.path}:${state.source.start_line || item.line || 1}`;
     note.setAttribute("aria-label", "Review note");
-    const save = el("button", "source-review-save", "Save review");
+    const save = el("button", "source-review-save", "Save triage");
     save.type = "button";
     const saveEntry = () => setReviewDisposition(item, disposition.value, note.value);
     save.addEventListener("click", saveEntry);
@@ -2440,10 +6482,198 @@ function renderSourceRisk() {
         }
     });
     controls.append(dispositionLabel, note, save);
-    panel.append(heading, reasons, controls);
+    const priority = el("details", "priority-review-details");
+    const triaged = current !== "pending" && current !== "reviewed";
+    priority.append(el("summary", "", triaged
+            ? `Concern triage: ${reviewStateLabel(current)}${record?.note ? ` — ${record.note}` : ""}`
+            : "Triage this concern (optional): accepted risk, false positive or follow-up"),
+        el("p", "muted", "Review progress comes from the whole-file decision below; triage records why a concern can be set aside."), controls);
+    panel.append(reasons, priority);
+    state.sourceStripRisk = { title: item.finding?.title || item.title, score: item.score,
+        reason: item.reasons.find((reason) => reason !== item.finding?.title) || null, triage: triaged ? reviewStateLabel(current) : null };
+    renderSourceStrip();
+}
+
+function renderMarkdownEvidence(panel) {
+    const path = state.source.path;
+    const facts = state.payload.model.instruction_documents;
+    if (!facts?.current?.documents?.[path] && !facts?.base?.documents?.[path]) return false;
+    const generation = state.payload.review_generation;
+    const cached = state.documentRoleView;
+    if (!cached || cached.generation !== generation) {
+        state.documentRoleView = { generation, loading: true };
+        api("/api/document-roles").then(({ roles }) => {
+            if (state.payload.review_generation !== generation) return;
+            state.documentRoleView = { generation, roles };
+            if (state.source) renderReviewContext();
+        }).catch((error) => {
+            if (state.payload.review_generation !== generation) return;
+            state.documentRoleView = { generation, error: error.message };
+            if (state.source) renderReviewContext();
+        });
+    }
+    const view = state.documentRoleView;
+    if (view.loading) { panel.append(el("p", "muted", "Loading document classification…")); return true; }
+    if (view.error) {
+        const retry = el("button", "link-button", "Retry classification");
+        retry.type = "button";
+        retry.addEventListener("click", () => { state.documentRoleView = null; renderReviewContext(); });
+        panel.append(el("p", "", `Unable to load document roles: ${view.error}`), retry);
+        return true;
+    }
+    const side = state.sourceTab === "base" || !facts.current.documents[path] ? "base" : "current";
+    const document = view.roles.documents[side][path];
+    if (!document) { panel.append(el("p", "muted", `This document is absent from the ${side} snapshot.`)); return true; }
+    const labels = { instructions: "Agent instructions", supporting: "Supporting reference", documentation: "Ordinary documentation", example: "Quoted / example material" };
+    const section = el("section", "review-context-question markdown-evidence");
+    section.append(el("h3", "", "Document role"),
+        el("p", "", `${labels[document.role]} · ${side === "base" ? "Base" : "Current"} saved snapshot${
+            document.overridden ? " · Reviewer correction" : document.inherited_correction ? " · From corrected reference path" : ""}`),
+        el("p", "muted", `Analyzer: ${labels[document.original_role]}. ${document.classification.reason}`));
+    const rationale = document.classification;
+    section.append(sourceReferenceButton("Classification evidence", { path: rationale.path || path, lines: [rationale.line || 1], side }));
+    const label = el("label", "", "Correct document role");
+    const select = el("select", "");
+    select.setAttribute("aria-label", "Correct document role");
+    for (const [value, title] of Object.entries(labels)) {
+        const option = el("option", "", title);
+        option.value = value;
+        select.append(option);
+    }
+    select.value = document.role;
+    label.append(select);
+    const save = el("button", "", "Save role"), reset = el("button", "link-button", "Reset to analyzer");
+    save.type = reset.type = "button";
+    reset.disabled = !document.overridden;
+    const status = el("p", "muted", view.roles.durable ? "Corrections are saved for this review snapshot." : "Memory-only: this provider has no session workspace.");
+    status.setAttribute("role", "status");
+    const submit = async (role) => {
+        save.disabled = reset.disabled = select.disabled = true;
+        status.textContent = "Saving document role…";
+        try {
+            await api("/api/document-roles", { method: "POST", body: JSON.stringify({
+                snapshot: view.roles.snapshot, revision: view.roles.revision, path, role,
+            }) });
+            state.payload = await api("/api/state");
+            state.documentRoleView = null;
+            render();
+            await renderSource({ preserveScroll: true });
+            if (state.selected) ensureAnnotation(state.selected);
+        } catch (error) {
+            status.textContent = `Unable to save: ${error.message}`;
+            save.disabled = select.disabled = false;
+            reset.disabled = !document.overridden;
+        }
+    };
+    save.addEventListener("click", () => void submit(select.value));
+    reset.addEventListener("click", () => void submit(null));
+    section.append(label, save, reset, status);
+    panel.append(section);
+    const relationships = el("section", "review-context-question");
+    relationships.append(el("h3", "", "How it reaches an agent"),
+        el("p", "muted", "Deterministic source references, not proof that an agent received, read, or obeyed this document."));
+    const edges = facts[side].relationships || [];
+    const queue = [path], visited = new Set([path]), selected = new Set();
+    let cycle = false;
+    while (queue.length && visited.size <= 40) {
+        const target = queue.shift();
+        for (const edge of edges.filter((edge) => edge.path === target
+            && (["instructions", "supporting"].includes(view.roles.documents[side][edge.from]?.role)
+                || ["supplies_instructions", "packages"].includes(edge.kind)))) {
+            if (selected.has(edge.id)) continue;
+            selected.add(edge.id);
+            const row = el("p", "");
+            row.append(sourceReferenceButton(`${edge.from}:${edge.line}`, { path: edge.from, lines: [edge.line], side }),
+                documentText(` ${edge.kind === "prescribes" ? "prescribes use of" : edge.kind} ${edge.path} (${edge.status})`));
+            relationships.append(row);
+            if (visited.has(edge.from)) { cycle = true; continue; }
+            visited.add(edge.from);
+            queue.push(edge.from);
+        }
+    }
+    if (!selected.size) relationships.append(el("p", "", document.root
+        ? "Recognized entry-point convention; no explicit supplying loader was established in this snapshot."
+        : "No incoming consumption path is established in the saved snapshot."));
+    if (cycle) relationships.append(el("p", "muted", "A reference cycle or converging path was encountered; no execution order is implied."));
+    if (visited.size > 40) relationships.append(el("p", "muted", "Consumption-path display was limited to 40 documents."));
+    const outgoing = edges.filter((edge) => edge.from === path);
+    const referenceDetails = el("details", "markdown-references");
+    referenceDetails.append(el("summary", "", `Local and external references (${outgoing.length})`));
+    for (const edge of outgoing.slice(0, 40)) {
+        const row = el("p", "");
+        row.append(sourceReferenceButton(`Line ${edge.line}`, { path, lines: [edge.line], side }),
+            documentText(` ${edge.kind}: ${edge.path || edge.target} — ${edge.status === "missing" ? "not found in saved snapshot" : edge.status}`));
+        if (edge.status === "resolved") row.append(documentText(" "), sourceReferenceButton("Open saved target", { path: edge.path, lines: [], side }));
+        referenceDetails.append(row);
+    }
+    if (outgoing.length > 40) referenceDetails.append(el("p", "muted", `${outgoing.length - 40} further references are omitted from this display.`));
+    if (outgoing.length) relationships.append(referenceDetails);
+    panel.append(relationships);
+    const verification = el("section", "review-context-question");
+    verification.append(el("h3", "", "Evidence and limits"),
+        el("p", "", "Deterministic checks: document structure and local reference resolution."),
+        el("p", "", "AI interpretation: explanations and semantic concerns are not execution guarantees."),
+        el("p", "", "Observed agent behavior: unavailable. Repository tests and code coverage do not measure instruction compliance."),
+        el("p", "muted", facts[side].precedence));
+    for (const gap of facts[side].gaps || []) verification.append(el("p", "muted", `${gap.path || "Markdown analysis"}: ${gap.reason}`));
+    panel.append(verification);
+    return true;
+}
+
+function documentText(text) {
+    return document.createTextNode(text);
+}
+
+function renderReviewContext() {
+    const panel = elements.source_review_context;
+    // Re-renders replace the verify controls; remember which one had keyboard focus so it can be restored.
+    const held = panel.contains(document.activeElement) ? document.activeElement.dataset?.focusKey || null : null;
+    panel.replaceChildren();
+    panel.classList.toggle("hidden", !state.source);
+    if (!state.source || !state.payload?.model) return;
+    if (renderMarkdownEvidence(panel)) return;
+    const annotation = state.payload.annotations?.[state.selected?.id];
+    const context = reviewContext(state.payload.model, { path: state.source.path, selected: state.selected,
+        decisionMap: state.payload.decision_map, run: state.payload.test_run, annotation });
+    const section = (title, lines) => {
+        const block = el("section", "review-context-question");
+        block.append(el("h3", "", title));
+        for (const line of lines) block.append(el("p", "", line));
+        panel.append(block);
+        return block;
+    };
+    if (!annotation?.body) section("What changed?", [context.change
+        ? context.change.generated
+            ? `${context.change.status} generated or minified file (built output): +${context.change.lines_added || 0} / -${context.change.lines_removed || 0} saved lines. It is not parsed for symbols; review the source that produces it instead.`
+            : `${context.change.status} file: +${context.change.lines_added || 0} / -${context.change.lines_removed || 0} saved lines. Inspect the diff for behavior.`
+        : "Related saved source, outside the changed-file scope."]);
+    const consumers = context.impact.counts["Potential consumer"];
+    const tests = context.impact.counts["Related test"];
+    const affected = section("Who might be affected?", [consumers || tests
+        ? `${consumers} potential consumer components and ${tests} related test components in the bounded, source-backed Impact view. Static relationships, not runtime proof.`
+        : "No source-backed consumer relationship is established for this selection. That does not establish no impact."]);
+    const impact = el("button", "link-button", "Inspect impact");
+    impact.type = "button";
+    impact.addEventListener("click", () => elements.source_impact.click());
+    affected.append(impact);
+    const verified = section("What was verified?", context.verification);
+    const layer = currentReadingLayer();
+    if (layer && (state.payload.model.changes || []).some((change) => change.path === state.source.path)) verified.prepend(verified.firstChild, layerVerifyBlock(layer));
+    section("What remains open?", context.gaps.length ? context.gaps : ["No additional gaps were recorded for this selection; this is not a correctness guarantee."]);
+    const wanted = state.layerVerifyFocus || held;
+    if (wanted && (document.activeElement === document.body || panel.contains(document.activeElement))) {
+        const target = [panel.querySelector(`[data-focus-key="${wanted}"]`), panel.querySelector('[data-focus-key="cancel"]'), panel.querySelector('[data-focus-key="run"]')]
+            .find((node) => node && !node.disabled);
+        if (target) {
+            target.focus({ preventScroll: true });
+            state.layerVerifyFocus = null;
+        }
+    }
 }
 
 function renderSourceDecisions() {
+    renderReviewContext();
+    renderTestTrace();
     const panel = elements.source_decisions;
     const map = state.payload?.decision_map;
     const model = state.payload?.model;
@@ -2451,7 +6681,7 @@ function renderSourceDecisions() {
     const subject = !selected ? null : selected.kind === "file" ? selected
         : model?.nodes.find((node) => node.id === (selected.node_id || selected.id)) || null;
     const callables = map?.status === "complete" ? callablesForSubject(map, model, subject) : [];
-    const loading = map?.status === "loading" && languageForPath(subject?.path)
+    const loading = map?.status === "loading" && languageForPath(subject?.path) && languageForPath(subject?.path).executable !== false
         && (isReviewSymbol(subject) || ["module", "file"].includes(subject.kind || subject.type));
     const run = state.payload?.test_run;
     const key = JSON.stringify([map?.status, map?.total_ms, subject?.id, subject?.path, state.source?.path,
@@ -2484,7 +6714,8 @@ function renderSourceDecisions() {
         }
         const rows = el("div", "decision-rows");
         rows.append(...item.entries.map((entry) => decisionRow(item, entry, (callable, value) => openDecision(callable, value, { select: false }))));
-        if (item.omitted_entries) rows.append(el("p", "muted decision-omitted", `${item.omitted_entries} more in the Code path changes view.`));
+        if (item.omitted_entries) rows.append(el("p", "muted decision-omitted",
+            `${countLabel(item.omitted_entries, "more code path change")} in the Code path changes view.`));
         panel.append(rows);
     }
 }
@@ -2493,6 +6724,17 @@ function packageVersion(item) {
     const declarations = item.declared_current || [];
     const declared = declarations.map((entry) => entry.specifier).filter(Boolean).join(", ");
     return item.resolved_current || declared || "version unspecified";
+}
+
+function packageLockParents(item) {
+    const parents = new Map();
+    for (const declaration of [...(item.declared_current || []), ...(item.declared_base || [])]) {
+        for (const parent of declaration.required_by || []) {
+            const key = `${parent.name}\0${parent.version || ""}\0${parent.source || ""}\0${parent.line || ""}`;
+            if (!parents.has(key)) parents.set(key, parent);
+        }
+    }
+    return [...parents.values()];
 }
 
 function packageKey(item) {
@@ -2506,6 +6748,7 @@ function packageEntry(item) {
 }
 
 function openPackage(item) {
+    if (state.mode !== "packages") rememberViewReturn();
     state.mode = "packages";
     state.stack = [];
     state.query = "";
@@ -2516,6 +6759,7 @@ function openPackage(item) {
 }
 
 function selectPackage(item) {
+    state.packageSelectionClosed = false;
     state.selectionEpoch += 1;
     state.selected = item;
     markSelectedCards();
@@ -2587,7 +6831,7 @@ function renderPackageView(model) {
     }
     const view = el("div", "package-view");
     const list = el("div", "package-list");
-    list.append(el("p", "package-list-heading", `${changes.length} package change${changes.length === 1 ? "" : "s"}`));
+    list.append(el("p", "package-list-heading", countLabel(changes.length, "package change")));
     for (const item of changes) {
         const row = el("button", `package-row${state.selected?.id === item.id ? " is-selected" : ""}`);
         row.type = "button";
@@ -2595,13 +6839,15 @@ function renderPackageView(model) {
         const heading = el("div", "package-row-heading");
         heading.append(el("strong", "", item.name), el("span", `label label-${item.change}`, item.change));
         const usage = item.usage_locations?.length || 0;
+        const lockedParents = packageLockParents(item);
         row.append(
             heading,
             el("small", "", `${item.ecosystem === "nuget" ? "NuGet · "
                 : item.ecosystem === "gomod" ? "Go module · "
                     : item.ecosystem === "cargo" ? "Cargo · " : ""}${packageVersionText(item)}${
-                item.change === "removed" ? "" : usage ? ` · used in ${usage} file${usage === 1 ? "" : "s"}`
-                    : item.ecosystem === "nuget" ? " · usage unresolved" : " · no usages found"}`),
+                item.change === "removed" ? "" : usage ? ` · used in ${countLabel(usage, "file")}`
+                    : lockedParents.length ? ` · required by ${countLabel(lockedParents.length, "locked package")}`
+                        : item.ecosystem === "nuget" ? " · usage unresolved" : " · no usages found"}`),
         );
         row.addEventListener("click", () => selectPackage(item));
         list.append(row);
@@ -2613,8 +6859,10 @@ function renderPackageView(model) {
     const current = changes.find((item) => item.id === state.selected?.id);
     if (current) {
         renderPackagePanel();
-    } else {
+    } else if (!state.packageSelectionClosed) {
         selectPackage(changes[0]);
+    } else {
+        renderPackagePanel();
     }
     restoreControlFocus(elements.graph, focused);
 }
@@ -2689,6 +6937,18 @@ function renderPackagePanel() {
     const header = el("header", "package-header");
     const titleRow = el("div", "package-title-row");
     titleRow.append(el("h2", "", item.name), el("span", `label label-${item.change}`, item.change));
+    const close = el("button", "view-close", "Close");
+    close.type = "button";
+    close.setAttribute("aria-label", "Close package details");
+    close.addEventListener("click", () => {
+        state.selected = null;
+        state.packageSelectionClosed = true;
+        renderPackagePanel();
+        const row = [...elements.graph.querySelectorAll(".package-row")].find((row) => row.dataset.package === item.id);
+        row?.classList.remove("is-selected");
+        row?.focus({ preventScroll: true });
+    });
+    titleRow.append(close);
     const declared = (item.declared_current?.[0] || item.declared_base?.[0]);
     header.append(
         titleRow,
@@ -2702,6 +6962,13 @@ function renderPackagePanel() {
             declared?.group ? `${declared.group} dependency` : null,
         ].filter(Boolean).join(" · ")),
     );
+    const packageDescription = assessment?.indicators?.provenance?.summary;
+    header.append(el("p", `package-description${packageDescription ? "" : " muted"}`,
+        packageDescription || (entry.assessmentError
+            ? "Package description unavailable because registry metadata could not be loaded."
+            : assessment
+                ? "No package description was provided by the public registry."
+                : "Loading package description from the public registry…")));
     sections.push(header);
     const declaration = el("p", "package-declaration-note");
     declaration.append(document.createTextNode(`Reported because a dependency declaration was ${item.change} in `));
@@ -2807,6 +7074,23 @@ function renderPackagePanel() {
 
     // Usage
     const usage = item.usage_locations || [];
+    const lockedParents = packageLockParents(item);
+    if (lockedParents.length) {
+        const parentList = el("ul", "usage-list");
+        for (const parent of lockedParents) {
+            const row = el("li", "");
+            row.append(el("strong", "", parent.name),
+                document.createTextNode(`${parent.version ? `@${parent.version}` : ""} requires ${item.name} ${parent.specifier || ""}`));
+            if (parent.source && parent.line) {
+                row.append(document.createTextNode(" · "), sourceReferenceButton(
+                    `${parent.source}:${parent.line}`,
+                    { path: parent.source, lines: [parent.line], packageName: item.name },
+                ));
+            }
+            parentList.append(row);
+        }
+        sections.push(packageSection(`${plural(lockedParents.length, "Locked dependency parent")} (${lockedParents.length.toLocaleString()})`, parentList));
+    }
     const usageList = el("ul", "usage-list");
     for (const location of usage) {
         const reference = parseSourceReference(location);
@@ -2815,10 +7099,12 @@ function renderPackagePanel() {
         usageList.append(row);
     }
     sections.push(packageSection(
-        `Static usage locations (${usage.length})`,
+        `${plural(usage.length, "Static usage location")} (${usage.length.toLocaleString()})`,
         usage.length ? usageList : el("p", "flash flash-attention", item.ecosystem === "nuget"
             ? "NuGet-to-assembly usage is unresolved. Namespace spelling does not prove package usage. Review the saved manifest and implementation."
-            : "No static import was mapped to this declaration. This is a manifest change, not an observed import. Verify why the dependency is needed: it may support tooling, dynamic loading, use a different import name, or be unused."),
+            : lockedParents.length
+                ? "No direct source import is expected for this transitive package. Its observed usage is the saved lockfile dependency chain above."
+                : "No static import was mapped to this declaration. This is a manifest change, not an observed import. Verify why the dependency is needed: it may support tooling, dynamic loading, use a different import name, or be unused."),
     ));
 
     if (assessment) {
@@ -2838,13 +7124,13 @@ function renderPackagePanel() {
             statTile("OpenSSF Scorecard", score != null ? `${score}/10` : null, score != null ? null : "No scorecard published",
                 score == null ? "" : score >= 7 ? "success" : score >= 4 ? "attention" : "danger", links.scorecard),
             statTile("Maintenance", maintenance.status ? maintenance.status : null,
-                `${maintenance.releases_last_12_months ?? 0} releases in 12 months${maintenance.latest_release_date ? ` · latest ${formatDate(maintenance.latest_release_date)}` : ""}`,
+                `${countLabel(maintenance.releases_last_12_months ?? 0, "release")} in 12 months${maintenance.latest_release_date ? ` · latest ${formatDate(maintenance.latest_release_date)}` : ""}`,
                 maintenance.status === "active" ? "success" : maintenance.status === "stale" ? "attention" : maintenance.status === "dormant" ? "danger" : "", links.maintenance),
             statTile("Downloads (last month)", formatCount(indicators.recent_downloads),
                 indicators.recent_downloads == null ? assessment.sources?.pypistats?.error || "Download data unavailable." : "Across all package versions.",
                 "", links.downloads),
             statTile("Reviewed version", assessment.version,
-                `${assessment.version ? indicators.release_age_days != null ? `${indicators.release_age_days} days old` : "age unknown"
+                `${assessment.version ? indicators.release_age_days != null ? `${countLabel(indicators.release_age_days, "day")} old` : "age unknown"
                     : "Declared as a range; no exact version in this snapshot."}${indicators.latest_version ? ` · latest ${indicators.latest_version}` : ""}${indicators.yanked ? " · YANKED" : ""}`,
                 indicators.yanked ? "danger" : "", links.release),
         );
@@ -2904,7 +7190,8 @@ function renderPackagePanel() {
         }
         const statuses = el("ul", "source-status evidence-sources");
         const sourceUrls = { pypi: links.registry, npm: links.registry, nuget: links.registry,
-            proxy: links.registry, crates_io: links.registry, osv: links.vulnerabilities, osv_history: links.vulnerabilities,
+            npm_downloads: links.downloads, proxy: links.registry, crates_io: links.registry,
+            osv: links.vulnerabilities, osv_history: links.vulnerabilities,
             scorecard: links.scorecard, pypistats: links.downloads };
         for (const [name, source] of Object.entries(assessment.sources || {})) {
             const row = el("li", `source-${source.status}`);
@@ -2943,19 +7230,24 @@ function renderCustomAnalyses() {
         summary.append(el("strong", "", prompt.title), el("span", `custom-status custom-${result?.status || "waiting"}`,
             !prompt.trusted ? "Approval required" : result?.status || "Waiting"));
         details.append(summary, el("p", "muted", `${prompt.scope === "global" ? "All repositories" : "This repository"} · Saved snapshot · AI-generated, verify claims`));
-        if (result?.content) {
+        appendInternalReview(details, result, `custom:${key}`, () => runCustomAnalyses({ scope: prompt.scope, id: prompt.id, force: false }));
+        if (result?.status === "running" && !result.coverage) {
+            details.append(aiPlaceholder(`custom:${key}`, "Copilot is running this check...", 3));
+        }
+        if (result?.content || result?.coverage) {
             markdownContext.subject = null;
             markdownContext.intent = null;
             const body = revealOnce(el("div", "annotation-body"), `custom:${key}`);
-            renderMarkdown(body, result.content);
+            if (result.coverage) renderInternalReviewBody(body, result);
+            else renderMarkdown(body, result.content);
             details.append(body);
-        } else if (["queued", "running"].includes(result?.status)) {
-            details.append(aiPlaceholder(`custom:${key}`, result.status === "queued" ? "Waiting for the previous check…" : "Copilot is running this check…", 3));
+        } else if (result?.status === "queued") {
+            details.append(aiPlaceholder(`custom:${key}`, "Waiting for the previous check...", 3));
         }
         if (result?.error) details.append(el("p", "error", result.error));
         const rerun = el("button", "", result ? "Run again" : "Run now");
         rerun.type = "button";
-        rerun.disabled = !prompt.trusted || state.payload.loading || ["queued", "running"].includes(result?.status);
+        rerun.disabled = !state.payload || !prompt.trusted || state.payload.loading || ["queued", "running"].includes(result?.status);
         rerun.addEventListener("click", () => runCustomAnalyses({ scope: prompt.scope, id: prompt.id, force: true }));
         details.append(rerun);
         children.push(details);
@@ -3045,38 +7337,78 @@ async function runCustomAnalyses(input = {}) {
     }
 }
 
+// Async data (sections, AI layer intents, progress) re-renders lists; keep keyboard focus on the same item instead of dropping it to <body>.
+function captureListFocus() {
+    const active = document.activeElement;
+    const container = active && active !== document.body
+        && active.closest("#graph, #review-finish, #overview-layers, #review-navigation");
+    if (!container) return () => {};
+    const selector = active.dataset.reviewId ? `[data-review-id="${CSS.escape(active.dataset.reviewId)}"]` : null;
+    const { tagName, className } = active;
+    const text = active.textContent;
+    return () => {
+        if (active.isConnected || (document.activeElement && document.activeElement !== document.body)) return;
+        const match = (selector && container.querySelector(selector))
+            || [...container.querySelectorAll(tagName)].find((item) => item.className === className && item.textContent === text);
+        match?.focus({ preventScroll: true });
+    };
+}
+
 function render() {
-    elements.review_target_label.textContent = state.payload?.review_target?.label || "Worktree";
+    const restoreFocus = captureListFocus();
+    try { renderView(); } finally { restoreFocus(); }
+}
+
+function renderView() {
+    const targetMode = state.payload?.review_target?.mode || "none";
+    renderAiSettings();
+    elements.review_target_label.textContent = state.payload?.review_target?.label || "Choose review target";
     const targetKey = JSON.stringify(state.payload?.review_target || {});
     if (state.reviewTargetKey !== targetKey) {
         state.reviewTargetKey = targetKey;
         const target = state.payload?.review_target;
-        state.reviewPickerPending = false;
+        state.reviewPickerPending = targetMode === "none";
         const selectedRef = target?.currentRef && target.mode === "commit" ? target.currentRef : target?.ref;
-        const pickerMatches = elements.review_mode.value === target?.mode
+        const pickerMatches = targetMode !== "none" && elements.review_mode.value === target?.mode
             && [...elements.review_ref.options].some((option) => option.value === selectedRef);
-        elements.review_mode.value = target?.mode || "worktree";
-        if (pickerMatches) elements.review_ref.value = selectedRef;
+        elements.review_mode.value = targetMode === "none" ? "" : targetMode;
+        if (targetMode === "none") {
+            elements.review_ref.classList.add("hidden");
+            elements.review_list_refresh.classList.add("hidden");
+            elements.review_more.classList.add("hidden");
+        } else if (pickerMatches) elements.review_ref.value = selectedRef;
         else loadReviewOptions({ selectedRef });
         resetReviewNavigation();
     }
     const payload = state.payload;
     const model = payload?.model;
+    elements.review_command_open.disabled = !model || Boolean(payload.loading);
+    elements.impact_view.disabled = !model || Boolean(payload.loading);
+    elements.sections_view.disabled = !model || Boolean(payload.loading);
     const worktreeNotice = !state.reviewPickerPending && !state.reviewSubmitting && !payload?.loading
         && payload?.review_target?.mode === "worktree" && (payload.worktree_changed || payload.worktree_check_error);
-    elements.worktree_notice.classList.toggle("hidden", !worktreeNotice);
+    // Freshness is one header chip; its explanation is disclosed on demand and the header Reanalyze is the single action.
+    elements.worktree_notice.classList.toggle("hidden", !worktreeNotice || !state.freshnessOpen);
     elements.worktree_notice_text.textContent = payload?.worktree_check_error
-        || "Worktree changed since this review. Reanalyze to include the latest edits.";
-    elements.worktree_reanalyze.disabled = Boolean(payload?.loading || state.connectionLost);
+        || "Worktree changed since this review. Reanalyze from the Overview header to include the latest edits.";
+    elements.status.setAttribute("aria-disabled", String(!worktreeNotice));
+    elements.status.setAttribute("aria-expanded", String(Boolean(worktreeNotice && state.freshnessOpen)));
+    // The header is hidden while reading code; the workflow row repeats only the stale state so it is never invisible.
+    elements.workspace_freshness.classList.toggle("hidden", !worktreeNotice);
+    elements.workspace_freshness.textContent = payload?.worktree_changed ? "Worktree changed" : "Freshness unknown";
+    elements.workspace_freshness.setAttribute("aria-expanded", String(Boolean(worktreeNotice && state.freshnessOpen)));
+    elements.refresh.classList.toggle("needs-attention", Boolean(worktreeNotice));
     elements.repository_identity.textContent = model?.metadata?.repo_root
         ? `${model.metadata.repo_root} · ${state.reviewPickerPending ? "Choose a comparison" : `Base ${model.metadata.base_sha?.slice(0, 8) || "empty tree"}`}` : payload?.repo_root || "";
     elements.change_repository.disabled = Boolean(payload?.loading || state.repositorySubmitting || state.connectionLost);
     const progress = payload?.progress;
     elements.status.textContent = payload?.loading ? `Analyzing ${progress?.percent || 0}%`
-        : payload?.cancelled ? "Analysis cancelled" : model ? payload.restored_from_cache ? "Saved review" : "Analysis current" : "Waiting";
+        : payload?.cancelled ? "Analysis cancelled" : payload?.error ? "Analysis failed" : model ? payload.restored_from_cache ? "Saved review" : "Analysis current"
+            : targetMode === "none" ? "Choose review" : "Reanalyze to continue";
     elements.status.title = payload?.loading ? progress?.message || "Analyzing repository"
         : payload?.analyzed_at ? `Analyzed ${new Date(payload.analyzed_at).toLocaleString()}${payload.restored_from_cache ? ". Reanalyze to update." : ""}` : "";
     elements.status.classList.toggle("working", Boolean(payload?.loading));
+    elements.status.classList.toggle("failed", Boolean(payload?.error));
     elements.status.classList.toggle("stale", Boolean(worktreeNotice));
     if (worktreeNotice) elements.status.textContent = payload.worktree_changed ? "Worktree changed" : "Freshness unknown";
     elements.refresh.disabled = Boolean(payload?.loading || state.reviewPickerPending || state.connectionLost);
@@ -3085,8 +7417,8 @@ function render() {
     elements.cancel_analysis.textContent = state.cancelling ? "Cancelling…" : "Cancel";
     elements.analysis_cancelled.classList.toggle("hidden", !payload?.cancelled);
     updateReviewApply();
-    elements.error.classList.toggle("hidden", !payload?.error);
-    elements.error.textContent = payload?.error || "";
+    // Background re-renders must not erase a client-side warning; it stays until the user opens other source or the review changes.
+    renderError();
     elements.analysis_progress.classList.toggle("hidden", !payload?.loading || state.connectionLost);
     if (payload?.loading) {
         const percent = Math.max(0, Math.min(100, Number(progress?.percent || 0)));
@@ -3097,6 +7429,7 @@ function render() {
         elements.analysis_progress.querySelector(".progress-track").setAttribute("aria-valuenow", String(percent));
     }
     renderReviewPickerNotice();
+    renderWorkspaceShell();
     renderConnectionNotice();
     renderCustomAnalyses();
     const clean = !state.reviewPickerPending && !state.reviewSubmitting && isEmptyReview(payload);
@@ -3108,8 +7441,12 @@ function render() {
         elements.clean_review.querySelector("p").textContent = worktreeNotice
             ? "Reanalyze to check the latest worktree. This saved snapshot does not include later edits."
             : state.connectionLost ? "This is the last saved result; it cannot confirm the current worktree while disconnected."
-                : "The selected snapshot has no reviewable changes against its baseline.";
-        for (const element of [elements.change_brief, elements.custom_analyses, elements.summary,
+                : model.metadata?.snapshot_exclusions?.changed_files
+                    ? `${countLabel(model.metadata.snapshot_exclusions.changed_files, "changed file")} excluded by snapshot rules: ${
+                        model.metadata.snapshot_exclusions.rules.map((rule) => `${rule.pattern} (${rule.reason === "user" ? "explicit exclude" : "default rule"}: ${rule.count})`).join("; ")
+                    }. No included files changed. Agent Review source is included automatically in its own source repository; installed extension files and caches remain excluded elsewhere.`
+                    : "The selected snapshot has no reviewable changes against its baseline.";
+        for (const element of [elements.review_overview, elements.review_background, elements.change_brief, elements.custom_analyses, elements.summary,
             elements.breadcrumbs, document.querySelector(".workspace"), elements.source_panel, elements.session_history_panel]) {
             element.classList.add("hidden");
         }
@@ -3122,6 +7459,7 @@ function render() {
     }
     loadClosedFindingKeys(model);
     loadReviewLedger(model);
+    ensurePrReview();
     if (state.queueError) showError(new Error(state.queueError));
     if (state.reviewLedgerError) showError(new Error(state.reviewLedgerError));
     if (!state.connectionLost && !payload.loading && !payload.cancelled) {
@@ -3136,16 +7474,17 @@ function render() {
         }
     }
     renderChangeBrief();
+    renderFinishReview();
     renderSummary(model);
     renderBreadcrumbs();
     const groupedObservations = [
         ...groupFindings(model.attention || []),
         ...(payload.generated_observations || []),
-    ].sort((a, b) => (b.impact_score || 0) - (a.impact_score || 0));
-    const active = groupedObservations.filter((item) => !isFindingClosed(item, state.closedFindingKeys));
-    const closed = groupedObservations.filter((item) => isFindingClosed(item, state.closedFindingKeys));
+    ].sort((a, b) => (concernPriority(b) ?? 0) - (concernPriority(a) ?? 0));
+    const active = groupedObservations.filter((item) => !concernClosed(item));
+    const closed = groupedObservations.filter((item) => concernClosed(item));
     elements.attention_count.textContent = String(active.length);
-    elements.attention_count.title = `${active.length} active · ${closed.length} closed findings`;
+    elements.attention_count.title = `${countLabel(active.length, "active finding")} · ${countLabel(closed.length, "closed finding")}`;
     renderCards(elements.attention, [
         ...collapseSizeFindings(active, model),
         ...collapseSizeFindings(closed, model),
@@ -3159,12 +7498,44 @@ function render() {
     const workspace = document.querySelector(".workspace");
     workspace.classList.toggle("package-mode", state.mode === "packages");
     workspace.classList.toggle("walkthrough-mode", state.mode === "walkthrough");
-    elements.zoom_out.disabled = state.mode === "graph" && state.stack.length === 0;
-    elements.zoom_out.title = state.mode !== "graph" ? "Back to architecture" : parent ? `Back from ${parent.name}` : "Already at architecture level";
-    elements.zoom_out.textContent = state.mode === "walkthrough" ? "Architecture" : "← Back";
-    if (state.mode === "walkthrough") {
-        elements.level_label.textContent = "REVIEW PLAN";
-        elements.graph_title.textContent = "Risk-first walkthrough";
+    workspace.classList.toggle("impact-mode", state.mode === "impact");
+    workspace.classList.toggle("sections-mode", state.mode === "sections");
+    elements.zoom_out.disabled = !state.viewHistory.length && state.stack.length === 0;
+    elements.zoom_out.title = state.viewHistory.length ? `Back to ${state.viewHistory.at(-1).label} (Alt+←)` : "Back (Alt+←)";
+    elements.zoom_out.textContent = "← Back";
+    elements.graph_close.title = `Close ${collectionTitle(state.mode)} and return to ${state.viewHistory.findLast((entry) => entry.kind !== "level")?.label || "Overview"}`;
+    elements.impact_view.setAttribute("aria-pressed", String(state.mode === "impact"));
+    elements.impact_view.textContent = "Impact";
+    elements.sections_view.setAttribute("aria-pressed", String(state.mode === "sections"));
+    elements.sections_view.textContent = "Sections";
+    renderWorkspaceNavigation();
+    renderWorkspaceShell();
+    if (state.reviewPage === "review" && state.exploring && state.mode === "findings") {
+        elements.level_label.textContent = "CONCERNS";
+        elements.graph_title.textContent = "All review concerns";
+        elements.graph.replaceChildren(elements.attention);
+    } else if (state.reviewPage === "review" && !state.exploring && !state.source) {
+        elements.graph.replaceChildren(el("div", "workspace-empty"));
+        const empty = elements.graph.firstChild;
+        empty.append(el("h2", "", "Choose a group or file to continue"),
+            el("p", "muted", "Changed code stays in the center; context and discussion stay beside it. Impact is available without leaving this review."));
+        if (state.workspaceReturn) {
+            const reopen = el("button", "review-next", "Return to code");
+            reopen.type = "button";
+            reopen.addEventListener("click", () => returnWorkspaceSource().catch(showError));
+            empty.append(reopen);
+        }
+    } else if (state.mode === "sections") {
+        elements.level_label.textContent = "GROUPED REVIEW";
+        elements.graph_title.textContent = "Source-backed review sections";
+        renderSections(model);
+    } else if (state.mode === "impact") {
+        elements.level_label.textContent = "CHANGE IMPACT";
+        elements.graph_title.textContent = "Evidence-backed impact";
+        renderImpact(model);
+    } else if (state.mode === "walkthrough") {
+        elements.level_label.textContent = "EXPLORE";
+        elements.graph_title.textContent = "Attention";
         renderReviewPlan(model, groupedObservations);
     } else if (state.mode === "graph") {
         elements.level_label.textContent = parent ? (parent.kind === "component" ? "MODULES" : "SYMBOLS") : "ARCHITECTURE";
@@ -3212,18 +7583,35 @@ function render() {
         renderCollection(model);
     }
     // Apply a server-side selection (an agent focus_item call) once; re-applying it on every render would override the user's own choice.
-    if (payload.selection?.id && payload.selection.id !== state.appliedServerSelection && state.selected?.id !== payload.selection.id) {
+    applyServerSelection(payload);
+    if (state.selected && payload.annotations?.[state.selected.id]) {
+        renderAnnotation(state.selected, payload.annotations[state.selected.id]);
+    }
+    if (state.source && !elements.source_panel.classList.contains("hidden")) renderSourceDecisions();
+    if (state.source && state.selected?.kind === "section" && !payload.annotations?.[state.selected.id]) renderSectionEvidence();
+    if (!state.selected) renderEmptyDetail();
+    applyReviewLocation().catch(showError);
+}
+
+function applyServerSelection(payload) {
+    const model = payload.model;
+    if (model && payload.selection?.id && payload.selection.id !== state.appliedServerSelection && state.selected?.id !== payload.selection.id) {
         state.appliedServerSelection = payload.selection.id;
         const all = [...model.nodes, ...model.edges, ...(model.package_changes || []), ...(model.attention || []), ...(payload.generated_observations || [])];
         const selected = all.find((item) => item.id === payload.selection.id) || { id: payload.selection.id, kind: "evidence" };
         state.selected = selected;
         renderDetail(selected);
     }
-    if (state.selected && payload.annotations?.[state.selected.id]) {
-        renderAnnotation(state.selected, payload.annotations[state.selected.id]);
-    }
-    if (state.source && !elements.source_panel.classList.contains("hidden")) renderSourceDecisions();
-    if (!state.selected) renderEmptyDetail();
+}
+
+function renderError() {
+    const payload = state.payload;
+    const clientError = state.clientError?.generation === payload?.review_generation ? state.clientError?.message : null;
+    analyzerErrorPresenter.render({
+        error: payload?.error, clientError, hasModel: Boolean(payload?.model),
+        initialization: payload?.progress?.message === "Repository initialization failed",
+        loading: payload?.loading, unavailable: state.connectionLost, retrying: state.analyzerRetryPending,
+    });
 }
 
 function showError(error) {
@@ -3231,8 +7619,9 @@ function showError(error) {
         markDisconnected();
         return;
     }
-    elements.error.textContent = error.message;
-    elements.error.classList.remove("hidden");
+    state.clientError = { message: error.message, generation: state.payload?.review_generation };
+    renderError();
+    renderWorkspaceShell();
 }
 
 async function reanalyze() {
@@ -3243,7 +7632,39 @@ async function reanalyze() {
     }
 }
 elements.refresh.addEventListener("click", reanalyze);
-elements.worktree_reanalyze.addEventListener("click", reanalyze);
+for (const button of elements.diff_layout.querySelectorAll("button")) {
+    button.addEventListener("click", () => setDiffLayout(button.dataset.layout));
+}
+// Crossing the split threshold re-renders the diff in the layout that fits.
+{
+    let wide = innerWidth >= SPLIT_DIFF_MIN_WIDTH;
+    window.addEventListener("resize", () => {
+        const now = innerWidth >= SPLIT_DIFF_MIN_WIDTH;
+        if (now === wide) return;
+        wide = now;
+        if (state.source && state.sourceTab === "diff" && diffLayoutPreference() === "split"
+            && !elements.source_panel.classList.contains("hidden")) setDiffLayout("split");
+        else renderDiffLayoutControl();
+    });
+}
+elements.source_strip_toggle.addEventListener("click", () => {
+    state.sourceStripOpen = !state.sourceStripOpen;
+    renderSourceStrip();
+});
+elements.status.addEventListener("click", () => {
+    if (elements.status.getAttribute("aria-disabled") === "true") return;
+    state.freshnessOpen = !state.freshnessOpen;
+    render();
+});
+elements.workspace_freshness.addEventListener("click", () => {
+    state.freshnessOpen = !state.freshnessOpen;
+    render();
+});
+// Reanalyze lives once, in the Overview header; from Review the notice leads there instead of duplicating it.
+elements.worktree_overview.addEventListener("click", () => {
+    elements.workflow_overview.click();
+    elements.refresh.focus({ preventScroll: true });
+});
 elements.cancel_analysis.addEventListener("click", async () => {
     state.cancelling = true;
     render();
@@ -3257,7 +7678,9 @@ elements.cancel_analysis.addEventListener("click", async () => {
     }
 });
 elements.zoom_out.addEventListener("click", () => {
-    if (state.mode !== "graph") {
+    if (state.viewHistory.length) {
+        returnPreviousView();
+    } else if (state.mode !== "graph") {
         resetToGraph();
     } else if (state.stack.length) {
         state.stack.pop();
@@ -3269,12 +7692,18 @@ elements.zoom_out.addEventListener("click", () => {
         render();
     }
 });
+elements.graph_close.addEventListener("click", () => returnPreviousView({ close: true }));
 elements.changed_only.addEventListener("change", () => {
     state.changedOnly = elements.changed_only.checked;
     clearSelection();
     render();
 });
-elements.detail_close.addEventListener("click", () => setDetailVisible(false));
+elements.detail_close.addEventListener("click", () => {
+    setDetailVisible(false);
+    const node = [...elements.graph.querySelectorAll(".node")].find((node) => node.dataset.nodeId === state.selected?.id);
+    (node || elements.detail_toggle).focus({ preventScroll: true });
+});
+elements.detail_back.addEventListener("click", () => elements.detail_close.click());
 elements.detail_toggle.addEventListener("click", () => setDetailVisible(!state.detailVisible));
 elements.review_search.addEventListener("input", () => {
     state.query = elements.review_search.value.trim();
@@ -3282,12 +7711,52 @@ elements.review_search.addEventListener("input", () => {
     render();
 });
 window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.navigationOpen && matchMedia("(max-width: 900px)").matches
+        && !document.querySelector("dialog[open]")) {
+        event.preventDefault();
+        state.navigationOpen = false;
+        renderWorkspaceShell();
+        elements.workspace_nav_toggle.focus({ preventScroll: true });
+        return;
+    }
+    if (document.querySelector("dialog[open]")) return;
+    if (event.key === "Escape" && state.detailVisible && matchMedia("(max-width: 900px)").matches
+        && elements.source_panel.classList.contains("hidden") && elements.detail.querySelector(".analysis-adapter-unavailable")) {
+        event.preventDefault();
+        setDetailVisible(false);
+        elements.detail_toggle.focus({ preventScroll: true });
+        return;
+    }
+    if (event.key === "Escape" && state.sourceFocused) {
+        event.preventDefault();
+        setSourceFocus(false);
+        elements.source_focus.focus({ preventScroll: true });
+        return;
+    }
     if (event.key === "Escape" && !elements.session_history_panel.classList.contains("hidden")) {
         elements.session_history_close.click();
         return;
     }
+    if (event.key === "Escape" && state.exploring && elements.source_panel.classList.contains("hidden")) {
+        if (event.target.closest?.("input, textarea, select, [contenteditable='true']")) return;
+        event.preventDefault();
+        if (state.detailVisible) elements.detail_close.click();
+        else elements.graph_close.click();
+        return;
+    }
     if (event.key === "Escape" && !elements.source_panel.classList.contains("hidden")) {
-        elements.source_close.click();
+        // Over an Explore lens the source is an overlay, so Esc returns to the lens. In Review, Esc never leaves the file:
+        // it clears the highlighted range, and Close remains the way to close it.
+        if (state.reviewPage !== "review" || state.exploring) {
+            elements.source_close.click();
+            return;
+        }
+        if (event.target.closest?.("input, textarea, select")) return;
+        event.preventDefault();
+        const marked = elements.source.querySelectorAll(".focus-line, .cited-line");
+        for (const row of marked) row.classList.remove("focus-line", "focus-start", "focus-end", "cited-line", "cited-start", "cited-end");
+        if (state.source) state.source.highlights = null;
+        if (!elements.source_panel.contains(document.activeElement)) elements.source.focus({ preventScroll: true });
         return;
     }
     if (event.altKey && ["ArrowLeft", "ArrowRight"].includes(event.key) && !elements.source_panel.classList.contains("hidden")) {
@@ -3295,37 +7764,95 @@ window.addEventListener("keydown", (event) => {
         navigateSource(event.key === "ArrowLeft" ? -1 : 1);
         return;
     }
-    if (event.altKey && event.key === "ArrowLeft" && (state.stack.length || state.mode !== "graph")) {
+    if (event.altKey && event.key === "ArrowLeft" && (state.viewHistory.length || state.stack.length || state.mode !== "graph")) {
         event.preventDefault();
         elements.zoom_out.click();
+        return;
+    }
+    if (event.isComposing || event.target.closest?.("input, textarea, select, [contenteditable='true']")) return;
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        openReviewCommands();
+        return;
+    }
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    const inReview = state.reviewPage === "review" && (document.activeElement === document.body
+        || document.activeElement.closest?.(".workspace, #source-panel, #review-navigation, #review-workflow"));
+    if (!inReview) return;
+    const key = event.key.toLowerCase();
+    if (key === "j" || key === "k") {
+        event.preventDefault();
+        if (state.reviewPage === "review" && !state.exploring && state.workspaceNavigation) {
+            const groupsById = new Map(state.workspaceNavigation.groups.map((group) => [group.id, group]));
+            const sequence = reviewSequence(state.workspaceNavigation, state.navigationMode)
+                .map((entry) => ({ file: entry.file, group: entry.group ? groupsById.get(entry.group) : null }));
+            const cursor = state.navigationCursor || { path: (state.source || state.workspaceReturn?.source)?.path, group: state.activeReviewGroup };
+            let current = sequence.findIndex((entry) => entry.file.path === cursor.path
+                && (!entry.group || entry.group.id === cursor.group));
+            // The cursor may name a provisional group recorded before review groups finished loading.
+            if (current < 0) current = sequence.findIndex((entry) => entry.file.path === cursor.path);
+            if (current < 0) current = key === "j" ? -1 : 0;
+            const next = sequence[(current + (key === "j" ? 1 : sequence.length - 1) + sequence.length) % sequence.length];
+            if (next) openWorkspaceFile(next.file, next.group).catch(showError);
+            return;
+        }
+        if (state.mode === "sections" && elements.source_panel.classList.contains("hidden")) {
+            const summaries = [...elements.graph.querySelectorAll(".section-card > summary")];
+            const current = summaries.indexOf(document.activeElement.closest("summary"));
+            const next = summaries[(current + (key === "j" ? 1 : summaries.length - 1) + summaries.length) % summaries.length];
+            if (next) {
+                next.parentElement.open = true;
+                next.scrollIntoView({ block: "nearest" });
+                next.focus({ preventScroll: true });
+            }
+        } else {
+            const cards = [...elements.attention.querySelectorAll(".review-card")];
+            let current = cards.findIndex((card) => card.dataset.itemId === state.selected?.id);
+            if (current < 0) current = key === "j" ? -1 : 0;
+            const next = cards[(current + (key === "j" ? 1 : cards.length - 1) + cards.length) % cards.length];
+            if (!next) return;
+            if (elements.source_panel.classList.contains("hidden")) next.focus({ preventScroll: true });
+            else {
+                state.sourceReturnFocus = next;
+                state.sourceOriginItemId = next.dataset.itemId;
+            }
+            next.click();
+        }
+    } else if (key === "a") {
+        event.preventDefault();
+        discussItem(focusedReviewItem()).catch(showError);
+    } else if (key === "i") {
+        event.preventDefault();
+        openImpact(focusedReviewItem());
+    } else if (key === "f") {
+        event.preventDefault();
+        setSourceFocus(!state.sourceFocused);
+    } else if (key === "c" && state.source && !elements.source_panel.classList.contains("hidden")) {
+        event.preventDefault();
+        commentOnCurrentLine();
+    } else if (key === "u" && state.source && state.sourceTab === "diff" && innerWidth >= SPLIT_DIFF_MIN_WIDTH) {
+        event.preventDefault();
+        setDiffLayout(diffLayoutPreference() === "split" ? "unified" : "split");
+    } else if (key === "m" && state.reviewPage === "review" && !state.exploring && !elements.file_review_form.classList.contains("hidden")) {
+        // Mark the open file and move on, without reaching for the footer (also works in focus mode). Held keys never mark a run of files.
+        event.preventDefault();
+        if (!event.repeat && !elements.file_review_next.disabled && !state.advancing) elements.file_review_form.requestSubmit(elements.file_review_next);
+    } else if (key === "/") {
+        event.preventDefault();
+        if (elements.review_search.getClientRects().length) elements.review_search.focus();
+        else openReviewCommands();
     }
 });
-let resizeTimer;
-function scheduleResizeRender() {
-    clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => {
-        requestAnimationFrame(() => requestAnimationFrame(() => {
-            if (state.payload?.model) render();
-        }));
-    }, 100);
-}
-function layoutSignature() {
-    const graphRect = elements.graph.getBoundingClientRect();
-    return [
-        document.documentElement.clientWidth,
-        document.documentElement.clientHeight,
-        window.visualViewport?.width ?? window.innerWidth,
-        window.visualViewport?.height ?? window.innerHeight,
-        Math.round(graphRect.width),
-        Math.round(graphRect.height),
-    ].join(":");
-}
-let lastLayoutSignature = layoutSignature();
+let resizeFrame = null;
 function detectHostResize() {
-    const signature = layoutSignature();
-    if (signature === lastLayoutSignature) return;
-    lastLayoutSignature = signature;
-    scheduleResizeRender();
+    if (document.hidden || resizeFrame !== null) return;
+    resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = null;
+        if (!document.hidden) {
+            renderWorkspaceShell();
+            resizeGraph(elements.graph);
+        }
+    });
 }
 window.addEventListener("resize", detectHostResize);
 window.addEventListener("focus", detectHostResize);
@@ -3334,9 +7861,8 @@ document.addEventListener("visibilitychange", () => {
 });
 window.visualViewport?.addEventListener("resize", detectHostResize);
 const resizeObserver = new ResizeObserver(detectHostResize);
-resizeObserver.observe(document.documentElement);
-resizeObserver.observe(document.body);
 resizeObserver.observe(elements.graph);
+// Retain the fallback for hosts that miss resize notifications.
 setInterval(detectHostResize, 500);
 
 let railResizeStart = null;
@@ -3346,7 +7872,7 @@ function setRailWidth(width) {
     const value = Math.max(190, Math.min(maximum, width));
     document.documentElement.style.setProperty("--review-rail-width", `${value}px`);
     localStorage.setItem("agent-review:rail-width", String(value));
-    scheduleResizeRender();
+    detectHostResize();
 }
 const savedRailWidth = Number(localStorage.getItem("agent-review:rail-width"));
 if (Number.isFinite(savedRailWidth) && savedRailWidth > 0) setRailWidth(savedRailWidth);
@@ -3371,7 +7897,111 @@ elements.rail_resize.addEventListener("keydown", (event) => {
     const current = document.querySelector(".rail").getBoundingClientRect().width;
     setRailWidth(current + (event.key === "ArrowRight" ? 20 : -20));
 });
+
+// ---- Resizable Review panes: the file navigation on the left and the evidence pane on the right ----
+// Widths persist across sessions and are clamped so the code always keeps a usable width.
+const PANE_WIDTHS = {
+    nav: { key: "agent-review.navigation-width", property: "--workspace-navigation-width", min: 180,
+        max: () => Math.max(240, Math.min(560, window.innerWidth - 640)) },
+    side: { key: "agent-review.evidence-width", property: "--source-side-width", min: 240,
+        max: () => Math.max(280, (elements.source_side_resize.parentElement?.clientWidth || window.innerWidth) - 360) },
+};
+
+function setPaneWidth(name, width, { persist = true } = {}) {
+    const pane = PANE_WIDTHS[name];
+    const value = Math.round(Math.max(pane.min, Math.min(pane.max(), width)));
+    document.documentElement.style.setProperty(pane.property, `${value}px`);
+    const handle = name === "nav" ? elements.workspace_nav_resize : elements.source_side_resize;
+    handle.setAttribute("aria-valuenow", String(value));
+    handle.setAttribute("aria-valuemin", String(pane.min));
+    handle.setAttribute("aria-valuemax", String(Math.round(pane.max())));
+    if (persist) { try { localStorage.setItem(pane.key, String(value)); } catch { /* still applies to this view */ } }
+    positionSideResize();
+    detectHostResize();
+}
+
+function resetPaneWidth(name) {
+    const pane = PANE_WIDTHS[name];
+    document.documentElement.style.removeProperty(pane.property);
+    try { localStorage.removeItem(pane.key); } catch { /* nothing saved */ }
+    positionSideResize();
+    detectHostResize();
+}
+
+const paneWidth = (name) => name === "nav"
+    ? elements.review_navigation.getBoundingClientRect().width
+    : document.querySelector(".source-side")?.getBoundingClientRect().width || 0;
+
+// The evidence-pane handle sits on the pane's left border wherever the grid puts it.
+function positionSideResize() {
+    const handle = elements.source_side_resize;
+    const side = handle.parentElement?.querySelector(".source-side");
+    const body = handle.parentElement;
+    const visible = Boolean(side && body && document.body.classList.contains("reviewing") && side.offsetWidth > 0
+        && getComputedStyle(body).display === "grid" && !document.body.classList.contains("review-source-focus"));
+    handle.classList.toggle("hidden", !visible);
+    if (visible) handle.style.left = `${side.offsetLeft}px`;
+}
+
+function wirePaneResize(name, handle) {
+    // Dragging toward the code widens the navigation; dragging toward the code narrows the evidence pane.
+    const direction = name === "nav" ? 1 : -1;
+    let start = null;
+    handle.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) return;
+        start = { x: event.clientX, width: paneWidth(name) };
+        handle.setPointerCapture(event.pointerId);
+        handle.classList.add("is-dragging");
+        document.body.classList.add("resizing-pane");
+        event.preventDefault();
+    });
+    handle.addEventListener("pointermove", (event) => {
+        if (!start || !handle.hasPointerCapture(event.pointerId)) return;
+        setPaneWidth(name, start.width + direction * (event.clientX - start.x), { persist: false });
+    });
+    const finish = (event) => {
+        if (!start) return;
+        start = null;
+        if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+        handle.classList.remove("is-dragging");
+        document.body.classList.remove("resizing-pane");
+        setPaneWidth(name, paneWidth(name));
+    };
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
+    handle.addEventListener("dblclick", () => resetPaneWidth(name));
+    handle.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home"].includes(event.key)) return;
+        event.preventDefault();
+        if (event.key === "Home") { resetPaneWidth(name); return; }
+        setPaneWidth(name, paneWidth(name) + direction * (event.key === "ArrowRight" ? 24 : -24));
+    });
+}
+wirePaneResize("nav", elements.workspace_nav_resize);
+wirePaneResize("side", elements.source_side_resize);
+for (const name of Object.keys(PANE_WIDTHS)) {
+    let saved = NaN;
+    try { saved = Number(localStorage.getItem(PANE_WIDTHS[name].key)); } catch { /* no saved width */ }
+    if (Number.isFinite(saved) && saved > 0) setPaneWidth(name, saved, { persist: false });
+}
+const paneObserver = new ResizeObserver(() => positionSideResize());
+for (const node of [document.querySelector(".source-side"), elements.source_side_resize.parentElement]) if (node) paneObserver.observe(node);
+window.addEventListener("resize", () => {
+    positionSideResize();
+    // Keep saved widths within the new window size.
+    for (const name of Object.keys(PANE_WIDTHS)) {
+        const current = parseFloat(document.documentElement.style.getPropertyValue(PANE_WIDTHS[name].property));
+        if (Number.isFinite(current) && current > PANE_WIDTHS[name].max()) setPaneWidth(name, current, { persist: false });
+    }
+});
 elements.source_close.addEventListener("click", () => {
+    if (state.sourceReturnView) {
+        restoreViewReturn(state.sourceReturnView).catch(showError);
+        return;
+    }
+    rememberWorkspaceSource();
+    setSourceFocus(false);
+    setDiscussionMode(false);
     const fileSelection = state.selected?.kind === "file";
     state.selectionEpoch += 1;
     state.source = null;
@@ -3383,6 +8013,38 @@ elements.source_close.addEventListener("click", () => {
         clearSelection();
         setDetailVisible(false);
     }
+    renderWorkspaceShell();
+    if (state.reviewPage === "review" && !state.exploring) {
+        state.navigationOpen = matchMedia("(max-width: 900px)").matches;
+        renderWorkspaceNavigation();
+        renderWorkspaceShell();
+        const file = [...elements.workspace_nav_list.querySelectorAll(".workspace-file")]
+            .find((button) => button.getAttribute("aria-current") === "location");
+        (file || elements.workspace_find).focus({ preventScroll: true });
+        render();
+        return;
+    }
+    if (state.mode === "impact") {
+        if (state.sourceReturnFocus?.isConnected) {
+            state.sourceReturnFocus.scrollIntoView({ block: "nearest" });
+            state.sourceReturnFocus.focus({ preventScroll: true });
+        } else focusImpactNode();
+    } else if (state.sourceReturnFocus?.isConnected && state.sourceReturnFocus.getClientRects().length) {
+        state.sourceReturnFocus.scrollIntoView({ block: "nearest" });
+        state.sourceReturnFocus.focus({ preventScroll: true });
+    } else {
+        const visible = (element) => element?.getClientRects().length ? element : null;
+        const card = [...document.querySelectorAll(".review-card[data-item-id]")]
+            .find((card) => card.dataset.itemId === (state.sourceOriginItemId || state.selected?.id) && visible(card));
+        const section = [...elements.graph.querySelectorAll(".section-card")]
+            .find((section) => section.dataset.sectionId === state.selected?.id)?.querySelector("summary");
+        const graphNode = [...elements.graph.querySelectorAll(".node")]
+            .find((node) => node.dataset.nodeId === (state.selected?.node_id || state.selected?.id));
+        const target = visible(section) || visible(graphNode) || card || visible(elements.review_command_open) || elements.workspace_find;
+        target.scrollIntoView({ block: "nearest" });
+        target.focus({ preventScroll: true });
+    }
+    state.sourceReturnFocus = null;
 });
 elements.source_back.addEventListener("click", () => navigateSource(-1));
 elements.source_forward.addEventListener("click", () => navigateSource(1));
@@ -3395,12 +8057,13 @@ elements.session_history_close.addEventListener("click", () => {
     elements.session_history_panel.classList.add("hidden");
     elements.session_transcript.replaceChildren();
     state.highlightedPromptEventId = null;
+    state.sessionHistoryReturnFocus?.();
 });
 document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => {
     state.sourceTab = tab.dataset.tab;
     const current = state.sourceHistory.entries[state.sourceHistory.index];
     if (current) current.tab = state.sourceTab;
-    renderSource();
+    renderSource().catch(showError);
 }));
 
 function updateReviewApply() {
@@ -3408,14 +8071,58 @@ function updateReviewApply() {
     elements.review_mode.disabled = busy;
     elements.review_ref.disabled = busy || Boolean(state.reviewOptionsLoading)
         || elements.review_mode.value === "worktree" || ![...elements.review_ref.options].some((option) => option.value);
+    elements.review_list_refresh.disabled = busy || Boolean(state.reviewOptionsLoading);
     elements.review_more.disabled = busy || Boolean(state.reviewOptionsLoading);
 }
 
 function resetReviewNavigation() {
+    state.sourceFocusReturn = null;
+    state.viewHistory = [];
+    state.sourceReturnView = null;
+    state.packageSelectionClosed = false;
+    state.annotationDisclosures.clear();
+    state.annotationView = null;
+    state.annotationGeneration = null;
+    clearTimeout(state.cursorSaveTimer);
+    state.progressReady = false;
+    state.progressSaving = false;
+    state.progressLoading = false;
+    state.progressError = null;
+    state.savedReviewCursor = null;
+    elements.review_background.open = false;
+    state.reviewPage = "overview";
+    state.navigationMode = "groups";
+    state.navigationQuery = "";
+    state.navigationKey = null;
+    state.navigationCursor = null;
+    state.navigationOpen = false;
+    state.activeReviewGroup = null;
+    state.workspaceReturn = null;
+    state.exploring = false;
+    state.readingPane = "code";
+    elements.workspace_search.value = "";
+    setSourceFocus(false);
+    state.appliedReviewLocation = null;
+    setDiscussionMode(false);
+    sourceRowCache.clear();
     state.selectionEpoch += 1;
     state.customOpenKeys.clear();
     state.selected = null;
     state.source = null;
+    state.sectionData = null;
+    state.sectionDataKey = null;
+    state.sectionLoadingKey = null;
+    state.sectionError = null;
+    state.layerSummaryRequested = null;
+    state.layerSummaryLoading = false;
+    state.layerSummaryError = null;
+    state.annotationRequests.clear();
+    state.prefetchedAnnotations = new Set();
+    state.prefetchStatus = null;
+    clearTimeout(state.prefetchTimer);
+    renderPrefetchStatus();
+    state.openSectionKeys = new Set();
+    state.openSectionRangeKeys = new Set();
     state.summaryKey = null;
     state.overviewLoading = false;
     state.overviewError = null;
@@ -3449,16 +8156,31 @@ function resetReviewNavigation() {
 function renderReviewPickerNotice() {
     const pending = Boolean(state.reviewPickerPending || state.reviewSubmitting
         || (state.payload?.loading && !state.payload.model));
-    for (const element of [elements.change_brief, elements.summary, elements.breadcrumbs, document.querySelector(".workspace")]) {
-        element.classList.toggle("hidden", pending);
+    const fatal = Boolean(state.payload?.error);
+    const restored = !pending && !fatal && !state.payload?.cancelled && !state.payload?.model
+        && ["worktree", "commit", "pr"].includes(state.payload?.review_target?.mode);
+    for (const element of [elements.review_overview, elements.review_background, elements.change_brief, elements.summary, document.querySelector(".workspace")]) {
+        element.classList.toggle("hidden", pending || isEmptyReview(state.payload) || (fatal && !state.payload.model));
     }
+    // renderBreadcrumbs owns their visibility once a review is open; the picker only hides them.
+    if (pending) elements.breadcrumbs.classList.add("hidden");
     const loading = state.reviewSubmitting || state.reviewOptionsLoading || state.payload?.loading;
-    elements.review_picker_notice.classList.toggle("hidden", !pending || (loading && !state.reviewOpenError));
-    if (pending) {
+    elements.review_picker_notice.classList.toggle("hidden", fatal || (!pending && !restored) || (loading && !state.reviewOpenError));
+    if (restored) {
+        elements.review_picker_notice.textContent = state.payload.review_target.mode === "worktree"
+            ? "Review target restored. Select Reanalyze to review the current worktree."
+            : "Review target restored. Select Reanalyze to review its saved commits.";
+    } else if (pending) {
         if (!loading) elements.review_target_label.textContent = "Choose a review target";
-        if (!state.payload?.loading) elements.status.textContent = loading ? "Loading review…" : "Choose review";
+        if (!state.payload?.loading) elements.status.textContent = fatal ? "Analysis failed" : loading ? "Loading review…" : "Choose review";
+        if (fatal) {
+            elements.review_picker_notice.replaceChildren();
+            return;
+        }
         elements.review_picker_notice.textContent = state.reviewOpenError ? ""
-            : `Select ${elements.review_mode.value === "pr" ? "a pull request" : "a commit"} to load its review automatically.`;
+            : !elements.review_mode.value
+                ? "Choose Worktree, Commit, or Pull request to begin analysis."
+                : `Select ${elements.review_mode.value === "pr" ? "a pull request" : "a commit"} to load its review automatically.`;
         if (state.reviewOpenError) {
             const retry = el("button", "brief-generate", "Retry review");
             retry.type = "button";
@@ -3468,7 +8190,9 @@ function renderReviewPickerNotice() {
     }
 }
 
-async function loadReviewOptions({ append = false, selectedRef = null } = {}) {
+async function loadReviewOptions({ append = false, selectedRef = null, refresh = false } = {}) {
+    // Rendering before the first state arrives resets the picker to blank; with no review type there is nothing to list.
+    if (!elements.review_mode.value) return;
     const epoch = (state.reviewOptionsEpoch || 0) + 1;
     state.reviewOptionsEpoch = epoch;
     const mode = elements.review_mode.value;
@@ -3476,6 +8200,7 @@ async function loadReviewOptions({ append = false, selectedRef = null } = {}) {
     elements.review_ref.classList.remove("hidden");
     elements.review_ref.required = mode !== "worktree";
     elements.review_more.classList.add("hidden");
+    elements.review_list_refresh.classList.toggle("hidden", mode === "worktree");
     elements.review_options_status.textContent = "";
     state.reviewOptionsLoading = mode !== "worktree";
     if (!append) {
@@ -3499,14 +8224,19 @@ async function loadReviewOptions({ append = false, selectedRef = null } = {}) {
     const page = append ? state.reviewOptionsPage + 1 : 0;
     elements.review_options_status.textContent = `Loading ${mode === "commit" ? "commits" : "pull requests"}…`;
     try {
-        const result = await api(`/api/review-targets?mode=${mode}&page=${page}`);
+        const result = refresh
+            ? await api("/api/review-targets/refresh", {
+                method: "POST",
+                body: JSON.stringify({ mode }),
+            })
+            : await api(`/api/review-targets?mode=${mode}&page=${page}`);
         if (epoch !== state.reviewOptionsEpoch) return;
         const existing = new Set([...elements.review_ref.options].map((option) => option.value));
         for (const item of result.items) {
             if (existing.has(item.ref)) continue;
             const date = item.date ? new Date(item.date).toLocaleDateString() : "";
-            const prefix = mode === "commit" ? item.short_sha : `#${item.number} · ${item.status}`;
-            const option = el("option", "", `${prefix} — ${item.title} · ${item.author || "Unknown author"} · ${date}`);
+            const prefix = mode === "commit" ? item.short_sha : `#${item.number} · ${item.status}${item.draft ? " · draft" : ""}`;
+            const option = el("option", "", `${prefix} — ${item.title} · ${item.author || "Unknown author"} · ${item.date_kind ? `${item.date_kind} ` : ""}${date}`);
             option.value = item.ref;
             elements.review_ref.append(option);
         }
@@ -3526,7 +8256,8 @@ async function loadReviewOptions({ append = false, selectedRef = null } = {}) {
         elements.review_more.textContent = "Load more";
         elements.review_more.classList.toggle("hidden", !result.has_more);
         elements.review_options_status.textContent = hasOptions
-            ? mode === "pr" ? result.repository || "" : ""
+            ? refresh ? `${mode === "commit" ? "Commit" : "Pull request"} list refreshed.`
+                : mode === "pr" ? result.repository || "" : ""
             : mode === "commit" ? "No commits found." : "No pull requests found for this repository.";
     } catch (error) {
         if (epoch !== state.reviewOptionsEpoch) return;
@@ -3560,10 +8291,62 @@ elements.review_ref.addEventListener("change", async () => {
     await openSelectedReview();
 });
 elements.review_more.addEventListener("click", () => loadReviewOptions({ append: state.reviewOptionsRetryAppend ?? true }));
+elements.review_list_refresh.addEventListener("click", () => loadReviewOptions({
+    selectedRef: elements.review_ref.value || null,
+    refresh: true,
+}));
 elements.review_target_form.addEventListener("submit", async (event) => {
     event.preventDefault();
     await openSelectedReview();
 });
+const AI_SETTINGS_NOTE = "Applies to new AI requests. Reanalyze refreshes saved results.";
+
+function renderAiSettings() {
+    const settings = state.payload?.ai_settings || { model: "session", language: "default" };
+    if (![...elements.ai_model.options].some((option) => option.value === settings.model)) {
+        elements.ai_model.append(new Option(settings.model, settings.model));
+    }
+    elements.ai_model.value = settings.model;
+    elements.ai_language.value = settings.language;
+}
+
+async function loadAiModels() {
+    if (state.aiModelsLoaded) return;
+    state.aiModelsLoaded = true;
+    elements.ai_settings_note.textContent = "Loading available models…";
+    try {
+        const { models } = await api("/api/ai-models");
+        for (const option of [...elements.ai_model.options]) {
+            if (option.value !== "session" && option.value !== "fusion") option.remove();
+        }
+        for (const model of models) elements.ai_model.append(new Option(model.name, model.id));
+        renderAiSettings();
+        elements.ai_settings_note.textContent = AI_SETTINGS_NOTE;
+    } catch (error) {
+        state.aiModelsLoaded = false;
+        elements.ai_settings_note.textContent = `Couldn't list models: ${error.message}`;
+    }
+}
+
+async function saveAiSettings() {
+    const settings = { model: elements.ai_model.value, language: elements.ai_language.value };
+    elements.ai_model.disabled = elements.ai_language.disabled = true;
+    try {
+        const result = await api("/api/ai-settings", { method: "POST", body: JSON.stringify(settings) });
+        if (state.payload) state.payload.ai_settings = result.ai_settings;
+    } catch (error) {
+        showError(error);
+    } finally {
+        elements.ai_model.disabled = elements.ai_language.disabled = false;
+        renderAiSettings();
+    }
+}
+
+elements.ai_settings.addEventListener("toggle", () => {
+    if (elements.ai_settings.open) void loadAiModels();
+});
+elements.ai_model.addEventListener("change", saveAiSettings);
+elements.ai_language.addEventListener("change", saveAiSettings);
 
 async function openSelectedReview() {
     if (state.reviewSubmitting || state.payload?.loading || state.reviewOptionsLoading
@@ -3585,6 +8368,7 @@ async function openSelectedReview() {
         elements.source_panel.classList.add("hidden");
         elements.session_history_panel.classList.add("hidden");
         state.payload = await api("/api/state");
+        state.clientError = null;
         elements.error.classList.add("hidden");
         render();
         window.scrollTo({ top: 0, behavior: "instant" });
@@ -3618,7 +8402,7 @@ elements.repository_picker_form.addEventListener("submit", async (event) => {
         state.payload = await api("/api/state");
         resetReviewNavigation();
         state.reviewTargetKey = null;
-        state.reviewPickerPending = false;
+        state.reviewPickerPending = true;
         state.customPrompts = [];
         state.customLibraryError = null;
         elements.repository_picker.close();
@@ -3681,10 +8465,10 @@ function renderConnectionNotice() {
         elements.status.classList.add("working");
         elements.analysis_progress.classList.add("hidden");
         elements.refresh.disabled = true;
-        elements.worktree_reanalyze.disabled = true;
         elements.cancel_analysis.disabled = true;
         updateReviewApply();
     }
+    renderError();
 }
 
 function markDisconnected() {
@@ -3709,6 +8493,8 @@ function connectEvents() {
     events.addEventListener("state", (event) => {
         if (state.eventSource !== events) return;
         const update = JSON.parse(event.data);
+        const previousOverview = state.payload?.annotations?.overview;
+        const previousLayers = state.payload?.annotations?.layers;
         state.eventSnapshotReceived = true;
         const payload = update.partial ? { ...state.payload, ...update } : update;
         if (payload.type === "repository-changed") {
@@ -3718,12 +8504,48 @@ function connectEvents() {
             state.customPrompts = [];
             state.customLibraryError = null;
         }
+        const roleCorrection = payload.type === "document-roles" && payload.model?.review_snapshot_key
+            && payload.model.review_snapshot_key === state.payload?.model?.review_snapshot_key;
         if (state.payload?.review_generation !== payload.review_generation
-            && payload.model && !payload.loading) resetReviewNavigation();
+            && payload.model && !payload.loading && !roleCorrection) resetReviewNavigation();
+        if (roleCorrection) {
+            state.documentRoleView = null;
+            state.annotationRequests.clear();
+            state.prefetchedAnnotations = new Set();
+            state.prefetchStatus = null;
+            state.overviewLoading = false;
+            state.layerSummaryLoading = false;
+            state.layerSummaryRequested = null;
+        }
         connectionFeedback.connected();
         state.payload = payload;
+        if (state.discussionMode && discussionPane.thread?.id === payload.discussion_update?.id) {
+            discussionPane.update(payload.discussion_update);
+        }
+        if (payload.type === "discussion") return;
+        if (payload.type === "connected" && state.discussionMode) discussionPane.refresh().catch(showError);
+        if (payload.type === "selection") {
+            applyServerSelection(payload);
+            return;
+        }
+        if (payload.type === "annotation") {
+            const overview = payload.annotations?.overview;
+            if (["body", "basis", "refining", "refine_error"].some((key) => previousOverview?.[key] !== overview?.[key])) renderChangeBrief();
+            if (previousLayers?.generated_at !== payload.annotations?.layers?.generated_at) {
+                renderWorkspaceNavigation();
+                renderReviewOverview();
+            }
+            const annotation = payload.annotations?.[state.selected?.id];
+            if (annotation) renderAnnotation(state.selected, annotation);
+            return;
+        }
         if (["connected", "refreshed", "repository-changed"].includes(state.payload.type)) loadCustomPrompts();
         render();
+        if (roleCorrection && state.source) {
+            renderSource({ preserveScroll: true }).then(() => {
+                if (state.selected) ensureAnnotation(state.selected);
+            }).catch(showError);
+        }
         if (state.payload.type === "session-history" && state.source?.path) {
             const epoch = state.selectionEpoch;
             refreshAttribution().then(() => {
@@ -3743,3 +8565,6 @@ function connectEvents() {
     };
 }
 connectEvents();
+}
+
+startApp().then(() => clearTimeout(startupTimer)).catch(showStartupFailure);

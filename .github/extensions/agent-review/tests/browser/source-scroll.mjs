@@ -1,3 +1,4 @@
+import { openChangeDetails } from "./review-details-helper.mjs";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { execFile } from "node:child_process";
@@ -8,6 +9,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ReviewState } from "../../review-state.mjs";
 import { startReviewServer } from "../../server.mjs";
+const openChangeSummary = async (page) => {
+    const details = page.locator("#review-background");
+    if (await details.isVisible() && !await details.evaluate((element) => element.open)) await details.locator(":scope > summary").click();
+};
+
 
 const require = createRequire(process.env.AGENT_REVIEW_BROWSER_PACKAGE || import.meta.url);
 const { chromium } = require("playwright-core");
@@ -63,7 +69,10 @@ try {
             const errors = [];
             page.on("pageerror", (error) => errors.push(error.message));
             await page.goto(`${server.url}?scoutTheme=${theme}`);
+            await openChangeDetails(page);
+
             await page.locator("#change-brief .brief-ai").waitFor();
+            await page.locator("#zoom-out").click();
             const symbol = state.model.nodes.find((node) => node.name === "first_target");
             const module = state.model.nodes.find((node) => node.id === symbol.module_id);
             const component = state.model.nodes.find((node) => node.id === symbol.component_id);
@@ -71,14 +80,14 @@ try {
             await page.locator(`.node[aria-label^="${module.name},"]`).click();
             await page.locator('.node[aria-label^="first_target,"]').click();
             await page.locator("#source .focus-start").waitFor();
-            assert.equal(await page.locator("#source").evaluate((code) => code.scrollTop), 0,
-                "a new diff starts at the top, even when the highlighted function is near the end");
+            assert.ok(await page.locator("#source").evaluate((code) => code.scrollTop > 0),
+                "a new diff navigates to the highlighted function");
             assert.match(await page.locator("#source .focus-start").textContent(), /def first_target/);
             await page.locator('.tab[data-tab="current"]').click();
             assert.ok(await page.locator("#source").evaluate((code) => code.scrollTop > 0),
                 "explicit source tabs still navigate to the referenced line");
             await page.locator('.tab[data-tab="diff"]').click();
-            assert.equal(await page.locator("#source").evaluate((code) => code.scrollTop), 0);
+            assert.ok(await page.locator("#source").evaluate((code) => code.scrollTop > 0));
             await page.locator("#source-provenance .provenance-prompt").waitFor();
             await page.locator("#source-annotation .annotation-body").waitFor();
             for (const tab of ["current", "base", "diff"]) {
@@ -98,6 +107,7 @@ try {
             assert.ok(scrolled.code > 0 && scrolled.side > 0, "both panes must genuinely scroll");
             if (width === 1280) assert.ok(scrolled.horizontal > 0);
             await page.click("#source-close");
+            await openChangeSummary(page);
             await page.locator("#summary .metric").filter({ hasText: "Files" }).click();
             for (const name of ["second", "first"]) {
                 await page.locator(".collection-row").filter({ hasText: `${name}.py` }).click();
@@ -115,7 +125,7 @@ try {
             }
             assert.deepEqual(errors, []);
             await page.close();
-            console.log(`PASS ${theme} ${width}px: new/reopened diffs and briefing panes start at top; highlights and source-tab focus retained`);
+            console.log(`PASS ${theme} ${width}px: source views navigate to selected code; briefing pane state and source-tab focus retained`);
         }
     }
 } finally {

@@ -8,6 +8,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ReviewState } from "../../review-state.mjs";
 import { startReviewServer } from "../../server.mjs";
+const openChangeSummary = async (page) => {
+    const details = page.locator("#review-background");
+    if (await details.isVisible() && !await details.evaluate((element) => element.open)) await details.locator(":scope > summary").click();
+};
 
 const require = createRequire(process.env.AGENT_REVIEW_BROWSER_PACKAGE || import.meta.url);
 const { chromium } = require("playwright-core");
@@ -91,7 +95,12 @@ try {
         state.packageAssessments.set(`npm:${item.name}@${item.resolved_current}`, {
             name: item.name, version: item.resolved_current,
             risk: { level: "unknown", score: 0, reasons: ["No public services are contacted by this regression."] },
-            sources: {}, indicators: {},
+            sources: { npm_downloads: { status: "ok" } },
+            indicators: {
+                provenance: { summary: `${item.name} registry description.` },
+                recent_downloads: 123456,
+                maintenance: { status: "active", releases_last_12_months: 2 },
+            },
         });
     }
     server = await startReviewServer(state);
@@ -105,11 +114,12 @@ try {
         const errors = [];
         page.on("pageerror", (error) => errors.push(error.message));
         await page.goto(`${server.url}?scoutTheme=${theme}`);
+        await openChangeSummary(page);
         await page.locator("#summary .metric").first().waitFor();
         await page.locator(".review-plan-row").first().waitFor();
         assert.match(await page.locator(".review-plan-row").first().textContent(), /resolveReference/);
-        assert.match(await page.locator(".quality-warning").textContent(), /source-matched LCOV\/Istanbul JSON/);
-        assert.doesNotMatch(await page.locator(".quality-warning").textContent(), /Generate coverage\.json or coverage\.xml/);
+        assert.match(await page.locator("#overview-limitation").textContent(), /source-matched LCOV\/Istanbul JSON/);
+        assert.doesNotMatch(await page.locator("#overview-limitation").textContent(), /Generate coverage\.json or coverage\.xml/);
         await page.locator("#zoom-out").click();
         assert.ok(await page.locator("#graph .node").count() > 0, "actual structural graph is rendered");
         await page.screenshot({ path: join(artifacts, `node-${theme}-graph.png`), fullPage: true });
@@ -125,28 +135,35 @@ try {
         await page.locator(`.node[aria-label^="${module.name},"]`).click();
         await page.locator('.node[aria-label^="resolveReference,"]').click();
         await page.waitForFunction(() => /packages\/core\/src\/resolver\.js:\d+/.test(document.querySelector("#source-title")?.textContent || ""));
-        assert.match(await page.locator("#source-risk").textContent(), /Cyclomatic complexity increased.*Priority \d+\/100/);
+        assert.match(await page.locator("#source-risk").textContent(),
+            /Cyclomatic complexity increased.*Static priority \d+\/100.*resolveReference increased from 1 to 3/s);
         await page.locator("#source-decisions .source-verification").waitFor();
         assert.match(await page.locator("#source-decisions .source-verification").textContent(), /Run linked tests/);
         if (theme === "light") {
+            if (await page.locator("#source-strip-toggle").getAttribute("aria-expanded") !== "true") await page.locator("#source-strip-toggle").click();
+            await page.locator(".priority-review-details > summary").click();
             await page.locator(".source-review-disposition").selectOption("follow-up");
             await page.locator(".source-review-note").fill("Exercise the legacy-reference error branch.");
             await page.locator(".source-review-save").click();
         }
         await page.locator("#source-close").click();
         if (theme === "light") {
-            await page.getByRole("button", { name: "Review plan", exact: true }).click();
-            assert.match(await page.locator(".review-progress").textContent(), /0 of \d+ reviewed · 1 needs follow-up/);
+            await page.locator("#breadcrumbs").getByRole("button", { name: "Attention", exact: true }).click();
+            assert.match(await page.locator(".review-progress").textContent(), /0 of \d+ attention items covered .* · 1 item needs follow-up/);
             assert.match(await page.locator('.review-plan-row[data-disposition="follow-up"]').textContent(),
                 /Exercise the legacy-reference error branch/);
         }
         if (theme === "light") await page.locator("#zoom-out").click();
         else await page.getByRole("button", { name: "Architecture", exact: true }).click();
+        await openChangeSummary(page);
         await page.locator("#summary .metric").filter({ hasText: "Packages" }).click();
         for (const item of packages) {
             await page.locator("#packages .review-card").filter({ hasText: new RegExp(item.name) }).click();
             await page.locator("#package-detail .usage-list").waitFor();
             assert.match(await page.locator("#package-detail").textContent(), new RegExp(item.resolved_current.replaceAll(".", "\\.")));
+            assert.equal(await page.locator("#package-detail .package-description").textContent(),
+                `${item.name} registry description.`);
+            assert.match(await page.locator("#package-detail").textContent(), /123,456/);
             await page.waitForFunction(() => !/Checking .* metadata/i.test(
                 document.querySelector("#package-detail")?.textContent || ""));
             const sourceLink = page.locator("#package-detail .usage-list .source-reference").first();
@@ -183,6 +200,7 @@ try {
         await page.screenshot({ path: join(artifacts, `node-${theme}-packages-narrow.png`), fullPage: true });
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), true);
         await page.setViewportSize({ width: 1440, height: 1000 });
+        await openChangeSummary(page);
         await page.locator("#summary .metric").filter({ hasText: "Code paths" }).click();
         await page.locator(".decision-view .decision-row").first().waitFor();
         assert.match(await page.locator(".decision-view").textContent(), /resolveReference|describeReference/);

@@ -4,6 +4,7 @@ from collections.abc import Callable
 from pathlib import PurePosixPath
 from typing import Any
 
+from git_snapshot import text_lines
 from go_coverage import load_go_coverage
 from go_graph import analyze_go
 from go_packages import go_package_diff, parse_go_packages
@@ -39,12 +40,13 @@ class GoAdapter:
                 raw = files.get(path)
                 saved[key] = raw.decode("utf-8-sig", errors="replace") if raw is not None else None
         model.repository["go_loc"] = sum(
-            len(raw.decode("utf-8", errors="replace").splitlines())
+            len(text_lines(raw))
             for path, raw in snapshot.current.items() if path.lower().endswith(".go")
         )
         model.warnings.append(
             "Go saved-source analysis does not evaluate build tags, cgo, generated code, "
-            "interface dispatch, reflection, or generic type inference; unresolved relationships remain unknown."
+            "interface dispatch, reflection, or generic type inference. "
+            "Call edges without a resolved target are omitted."
         )
         analyze_go(snapshot.baseline, snapshot.current, model,
                    {item["name"] for item in dependencies["current"]},

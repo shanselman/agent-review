@@ -67,9 +67,16 @@ export function callableName(item) {
 
 const testName = (id) => String(id).split("::").at(-1);
 
-// Parametrized results (`test_x[case]`) belong to the statically linked `test_x`.
+// Parametrized results (`test_x[case]`, including nested brackets like `test_x[[1, 2]]`) belong to the statically linked `test_x`.
 export function baseTestId(id) {
-    return String(id).replace(/\[[^\]]*\]$/, "");
+    const text = String(id);
+    if (!text.endsWith("]")) return text;
+    let depth = 0;
+    for (let index = text.length - 1; index >= 0; index--) {
+        if (text[index] === "]") depth++;
+        else if (text[index] === "[" && --depth === 0) return text.slice(0, index);
+    }
+    return text;
 }
 
 export function sameTest(traceId, linkedId) {
@@ -95,7 +102,7 @@ export function pathEvidence(item, entry, run) {
     const evidence = entry.evidence || { level: "none", tests: [] };
     const coverage = evidence.coverage ? ` · coverage report: ${evidence.coverage}` : "";
     const key = `${item.id}:${entry.decision.line}`;
-    const current = run?.status === "complete" && !run.stale;
+    const current = (run?.status === "complete" || (run?.status === "running" && run.executed)) && !run.stale;
     const executed = current ? run.executed?.[key] : undefined;
     if (executed?.length) {
         const passing = executed.filter((test) => test.outcome === "passed");
@@ -108,7 +115,7 @@ export function pathEvidence(item, entry, run) {
     const first = evidence.tests?.[0];
     let result;
     if (evidence.level === "asserted" && first) {
-        const ambiguous = first.ambiguous ? ` — the same check matches ${first.ambiguous} paths` : "";
+        const ambiguous = first.ambiguous ? ` — the same check matches ${countLabel(first.ambiguous, "path")}` : "";
         result = { level: "asserted", tone: "inferred", text: `Asserted (inferred): \`${testName(first.id)}\` checks \`${first.assertion?.text || first.match}\`${ambiguous}` };
     } else if (evidence.level === "exercised" && first) {
         result = { level: "exercised", tone: "inferred", text: `Called by \`${testName(first.id)}\`; this outcome is not asserted (inferred)` };
@@ -117,11 +124,13 @@ export function pathEvidence(item, entry, run) {
     } else if (evidence.level === "possible" && first) {
         result = { level: "possible", tone: "weak", text: `Name match only: \`${testName(first.id)}\` (inferred)` };
     } else {
-        result = { level: "none", tone: "untested", text: "No test evidence" };
+        result = { level: "none", tone: "untested",
+            text: evidence.limited ? "No test evidence in incomplete analysis" : "No test evidence" };
     }
     const ran = current ? run.ran?.[item.id] ?? (run.ran ? 0 : run.planned) : 0;
     if (Array.isArray(executed) && ran > 0) {
-        result = { level: "not-executed", tone: "untested", text: `Not executed by the ${ran} linked test${ran === 1 ? "" : "s"} that ran · ${result.text}` };
+        result = { level: "not-executed", tone: "untested",
+            text: `Not executed by the ${countLabel(ran, "linked test")} that ran · ${result.text}` };
     } else if (current && executed === null && ran > 0) {
         result = { ...result, text: `${result.text} · the run cannot confirm this path because its condition shares the proof line` };
     }
@@ -136,6 +145,57 @@ export const EVIDENCE_GROUPS = {
     inferred: ["asserted", "exercised", "reachable", "possible"],
     untested: ["none", "not-executed"],
 };
+
+const testPath = (test) => test.path || String(test.id).split("::")[0];
+
+// The slice of a decision map that belongs to one reading layer: its files' callables and the linked tests that reach
+// them or are declared in its files. Every language adapter plans from this shape, so a layer can be verified alone.
+export function scopeDecisionMap(map, paths) {
+    if (!map || map.status !== "complete") return map;
+    const inScope = new Set(paths);
+    const callables = (map.callables || []).filter((item) => inScope.has(item.path));
+    const ids = new Set(callables.map((item) => String(item.id)));
+    const names = new Set(callables.map((item) => item.qualname));
+    const reaches = (test) => test.callable_ids ? test.callable_ids.some((id) => ids.has(String(id)))
+        : (test.callables || []).some((name) => names.has(name));
+    const tests = (map.verification?.tests || []).filter((test) => reaches(test) || inScope.has(testPath(test)));
+    // A multi-language map narrows to the languages this layer actually contains, so a one-language layer can run.
+    const adapters = map.adapter_ids ? [...new Set([...callables, ...tests].map((item) => item.adapter_id).filter(Boolean))] : null;
+    return { ...map, callables, verification: map.verification ? { ...map.verification, tests, omitted_tests: 0 } : map.verification,
+        ...(adapters ? adapters.length === 1 ? { adapter_ids: undefined, adapter_id: adapters[0] } : { adapter_ids: adapters.length ? adapters : map.adapter_ids } : {}) };
+}
+
+// What a run says about one layer: how many of its linked tests ran, and their worst outcomes.
+export function layerTestStatus(map, run, paths) {
+    if (!map || map.status !== "complete") return { state: map?.status === "loading" ? "loading" : "unavailable", linked: 0 };
+    const tests = (scopeDecisionMap(map, paths).verification?.tests || []).filter((test) => test.link !== "name-only");
+    if (!tests.length) return { state: "none", linked: 0 };
+    const counts = { passed: 0, failed: 0, error: 0, skipped: 0, not_run: 0 };
+    const complete = run?.status === "complete" || run?.tests?.length || run?.history?.length;
+    for (const test of tests) {
+        const outcome = complete ? linkedTestOutcome(run, test.id) : undefined;
+        counts[outcome && counts[outcome] !== undefined ? outcome : "not_run"]++;
+    }
+    const ran = tests.length - counts.not_run;
+    const outcome = !ran ? "not-run" : counts.failed || counts.error ? "failing" : counts.not_run ? "partial" : counts.skipped ? "skipped" : "passed";
+    const running = run?.status === "running" && (!run.scope || run.scope.paths?.some((path) => paths.includes(path)));
+    // While this layer is being run again, the results recorded before the run stay available as `outcome`.
+    return { state: running ? "running" : outcome, outcome, linked: tests.length, ran, counts, stale: Boolean(run?.stale && ran) };
+}
+
+// Combines a run with earlier results of the same snapshot, so verifying layer after layer accumulates evidence. Every
+// earlier result of a test the new run planned is replaced, even when runners name results differently per run.
+export function mergeTestRuns(previous, next, planned = []) {
+    const rerun = (test) => planned.some((id) => sameTest(test.id, id));
+    const tests = new Map((previous.tests || []).filter((test) => !rerun(test)).map((test) => [test.id, test]));
+    for (const test of next.tests || []) tests.set(test.id, test);
+    const list = [...tests.values()];
+    return { ...next, tests: list, executed: { ...(previous.executed || {}), ...(next.executed || {}) },
+        ran: { ...(previous.ran || {}), ...(next.ran || {}) },
+        ...(next.path_evidence_limitation || previous.path_evidence_limitation
+            ? { path_evidence_limitation: next.path_evidence_limitation || previous.path_evidence_limitation } : {}),
+        counts: Object.fromEntries(["passed", "failed", "error", "skipped"].map((outcome) => [outcome, list.filter((test) => test.outcome === outcome).length])) };
+}
 
 export function evidenceCounts(map, run) {
     const counts = { confirmed: 0, inferred: 0, untested: 0 };
@@ -168,11 +228,11 @@ export function decisionTotals(map) {
 export function callablesForSubject(map, model, subject) {
     if (!map?.callables?.length || !subject) return [];
     const path = subject.path;
-    if (["function", "method", "property", "accessor"].includes(subject.kind) || ["function", "method", "property", "accessor"].includes(subject.type)) {
+    if (["function", "method", "property", "accessor", "constructor", "destructor", "operator", "lambda"].includes(subject.kind || subject.type)) {
         return map.callables.filter((item) => item.id === subject.id);
     }
-    if (["class", "interface", "struct", "enum", "trait", "record", "namespace", "type"].includes(subject.kind || subject.type)) {
-        if (["csharp", "rust"].includes(subject.language)) {
+    if (["class", "interface", "struct", "union", "enum", "trait", "record", "namespace", "type"].includes(subject.kind || subject.type)) {
+        if (["csharp", "rust", "cpp"].includes(subject.language)) {
             const descendants = new Set([subject.id]);
             let size;
             do {
@@ -217,16 +277,19 @@ export function decisionPromptContext(map, callables = map?.callables || [], { m
         items.push({
             callable: callableName(item), path: item.path, change: item.change, line: item.line,
             decisions_before: item.decisions_base, decisions_after: item.decisions_current,
-            changes: changes.length ? changes : [item.change === "modified"
+            incomplete: Boolean(map.limited || map.incomplete || item.incomplete || item.truncated),
+            changes: changes.length ? changes : [map.limited || map.incomplete || item.incomplete || item.truncated ? "partial code path model; no modelled changes"
+                : item.change === "modified"
                 ? "no code path changes (same exits, handlers, and wiring)" : "no exits, handlers, or wiring"],
             omitted_changes: Math.max(0, (item.entries?.length || 0) - changes.length) + (item.omitted_entries || 0),
         });
     }
     return {
         note: "Static extraction from saved source: exits, error handlers, and name-based wiring per changed callable, with governing conditions. 'only if' gates apply only when a value is present. It does not prove runtime reachability.",
-        evidence_note: map.verification ? "Test evidence per path: 'Confirmed' means a linked test run executed that line; 'inferred' links come from static analysis of test calls and assertions and are not proof; 'Not executed' means the linked tests ran without reaching it; 'No test evidence' means no test calls the function or its callers." : undefined,
-        limited: Boolean(map.limited) || omitted > 0,
+        evidence_note: map.verification ? "Test evidence per path: 'Confirmed' means a linked test run executed that line; 'inferred' links come from static analysis of test calls and assertions and are not proof; 'Not executed' means the linked tests ran without reaching it; 'No test evidence' means no resolved test link in the analyzed subset; omitted or unresolved relationships remain unknown." : undefined,
+        limited: Boolean(map.limited || map.incomplete) || callables.some((item) => item.incomplete || item.truncated) || omitted > 0,
         callables: items,
         omitted_callables: omitted,
     };
 }
+import { countLabel } from "./count-format.mjs";
